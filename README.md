@@ -16,7 +16,6 @@ This repository contains a socket-based chat application built for networking pr
 
 - `server.py` — chat server, IDS, monitoring, and optional ngrok integration
 - `secure_chat.py` — main PySide6 GUI client (recommended)
-- `client.py` — minimal CLI test client
 - `firebase_config.py` — Firebase helper (demo mode if credentials are absent)
 - `requirements.txt` — Python dependencies
 - `run_secure_chat.bat` — Windows launcher for the GUI
