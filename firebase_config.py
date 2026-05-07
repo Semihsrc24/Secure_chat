@@ -3,13 +3,23 @@ Firebase Configuration
 Uses Firebase Realtime Database and Authentication
 """
 
-import firebase_admin
-from firebase_admin import credentials, db, auth
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import secrets
+
+# Gracefully handle missing firebase_admin package
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db, auth
+    _HAS_FIREBASE = True
+except ImportError:
+    _HAS_FIREBASE = False
+    firebase_admin = None
+    credentials = None
+    db = None
+    auth = None
 
 
 def _load_dotenv_file() -> None:
@@ -57,6 +67,13 @@ class FirebaseManager:
             return
 
         try:
+            # Check if firebase_admin is available
+            if not _HAS_FIREBASE:
+                print("⚠️  firebase_admin not installed → Demo mode enabled")
+                self._demo_mode = True
+                self._initialized = True
+                return
+
             # Firebase Admin SDK başlat
             if not os.path.exists(CREDENTIALS_PATH):
                 print(f"⚠️  {CREDENTIALS_PATH} not found!")

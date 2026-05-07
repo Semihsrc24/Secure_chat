@@ -23,8 +23,8 @@ from PySide6.QtGui import QFont, QIcon, QPixmap, QColor, QTextCursor, QTextBlock
 from firebase_config import firebase
 
 # Direct ngrok defaults (hardcoded to avoid env pollution)
-SOCKET_HOST = os.getenv("CHAT_SOCKET_HOST", "8.tcp.ngrok.io")
-SOCKET_PORT = int(os.getenv("CHAT_SOCKET_PORT", "11188"))
+SOCKET_HOST = os.getenv("CHAT_SOCKET_HOST", "6.tcp.ngrok.io")
+SOCKET_PORT = int(os.getenv("CHAT_SOCKET_PORT", "15598"))
 
 print(f"[CONFIG] CHAT_SOCKET_HOST={SOCKET_HOST} CHAT_SOCKET_PORT={SOCKET_PORT}")
 

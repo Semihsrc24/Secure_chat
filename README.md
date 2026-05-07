@@ -1,77 +1,77 @@
-# Secure Chat and Intrusion Detection System
+# Secure Chat — Socket-based Real-time Chat with IDS
 
-Bu proje, Computer Networks dersi için gelistirilmis socket tabanli bir sohbet sistemidir.
+This repository contains a socket-based chat application built for networking projects. It includes a central chat server with simple intrusion detection rules, a PySide6 GUI client, and utilities for testing.
 
-## Ozellikler
+## Features
 
-- TCP tabanli merkezi chat server
-- Coklu istemci destegi (thread tabanli)
-- Komutlar: `/list`, `/nick <yeniad>`, `/stats`, `/quit`
-- Monitoring (bagli istemci, mesaj/alert sayaçlari)
-- Intrusion Detection kurallari:
-  - Spam/Flood (zaman penceresinde mesaj hizi)
-  - Repeated message flooding
-  - Bos/malformed davranis kontrolu
-- Supheli davranista gecici blok
-- `server.log` dosyasina loglama
-- GUI istemci:
-  - PySide6 tabanli: `gui_client_qt.py`
-  - Tkinter tabanli: `gui_client.py` (yedek)
+- Central TCP chat server
+- Multi-client support (threaded)
+- Basic commands: `/list`, `/nick <name>`, `/stats`, `/quit`
+- Monitoring: connected clients, message/alert counters
+- Simple Intrusion Detection rules for flooding/spam and repeated messages
+- Temporary blocking of suspicious clients
+- Firebase integration for optional authentication and message persistence
 
-## Proje Dosyalari
+## Included Files
 
-- `server.py`: Chat server + IDS + monitoring + logging
-- `client.py`: Komut satiri istemci
-- `gui_client_qt.py`: PySide6 GUI istemci
-- `gui_client.py`: Tkinter GUI istemci
-- `server.log`: Sunucu olay kayitlari
+- `server.py` — chat server, IDS, monitoring, and optional ngrok integration
+- `secure_chat.py` — main PySide6 GUI client (recommended)
+- `client.py` — minimal CLI test client
+- `firebase_config.py` — Firebase helper (demo mode if credentials are absent)
+- `requirements.txt` — Python dependencies
+- `run_secure_chat.bat` — Windows launcher for the GUI
 
-## Kurulum
+Files excluded from the repository (should be present locally if needed):
 
-Python 3.9+ onerilir.
+- `serviceAccountKey.json` — Firebase service account file (DO NOT commit)
 
-Firebase login icin proje kokune bir `.env` dosyasi ekleyebilirsin:
+## Setup
 
-```env
-FIREBASE_WEB_API_KEY=your_firebase_web_api_key
+1. Create and activate a virtual environment:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install PySide6
+2. Install dependencies:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Calistirma
+3. (Optional) Place Firebase credentials at the project root as `serviceAccountKey.json` to enable full Firebase functionality.
 
-### 1) Server
+## Run
 
-```bash
+Start the server (on the host machine):
+
+```powershell
 python server.py
 ```
 
-### 2) CLI Client
+Start the GUI client (on any machine; set `CHAT_SOCKET_HOST`/`CHAT_SOCKET_PORT` if using ngrok):
 
-```bash
-python client.py --host 127.0.0.1 --port 5555
+```powershell
+python secure_chat.py
 ```
 
-### 3) GUI Client (onerilen)
+Alternatively use the included Windows launcher:
 
-```bash
-python gui_client_qt.py
+```powershell
+run_secure_chat.bat
 ```
 
-## Test Senaryolari (Ozet)
+## Notes
 
-1. Normal chat: Iki istemci baglanir, mesajlasma dogrulanir.
-2. Komut testi: `/list`, `/nick`, `/stats`, `/quit`.
-3. IDS testi: Hizli mesaj/flood ve tekrar mesaj davranisi ile alert tetiklenmesi.
-4. Block testi: Alert sonrasi gecici engel ve sure dolunca normale donus.
-5. Log testi: `grep ALERT server.log` ile kanit satirlari.
+- Keep your Firebase keys out of the repository. The project automatically uses demo mode when no service account is present.
+- If using ngrok, run the server with ngrok enabled to obtain a public TCP endpoint and share the `tcp://...` address with remote clients.
 
-## Notlar
+## License
 
-- Test sirasinda IDS spam esigi gecici olarak degistirildiyse, teslim oncesi dokuman esigine geri alinmalidir.
-- Farkli bilgisayardan baglanmak icin karsi tarafin sadece istemciyi calistirmasi yeterlidir; server tek noktada calisir.
+MIT
+
+---
+
+If you want additional cleanup (remove virtualenvs, build a single executable, or publish a release), tell me which step to perform next.
