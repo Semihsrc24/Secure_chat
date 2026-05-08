@@ -138,13 +138,15 @@ def check_repeated_message(username, current_msg):
         return False
     
     with repeat_count_lock:
-        if last_message.get(username) == current_msg:
+        prev = last_message.get(username)
+        if prev == current_msg:
             repeat_count[username] = repeat_count.get(username, 0) + 1
         else:
             repeat_count[username] = 1
             last_message[username] = current_msg
         
         current_repeat = repeat_count[username]
+        print(f"[DEBUG_SPAM] user={username} prev_key={(prev[:20] if isinstance(prev, str) else prev)} new_key={(str(current_msg)[:20])} repeat={current_repeat}")
     
     if current_repeat >= REPEAT_MESSAGE_THRESHOLD:
         # Determine block level based on current block entry (exponential)
