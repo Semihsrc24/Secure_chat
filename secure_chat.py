@@ -8,6 +8,8 @@ import queue
 import threading
 import time
 import hashlib
+
+LOCAL_SPAM_THRESHOLD = 5
 import html
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -685,6 +687,59 @@ class ChatWindow(QWidget):
         self.socket_timer.timeout.connect(self.process_socket_events)
         self.socket_timer.start(300)
 
+        self.chat_blocked_until = 0.0
+        self.chat_block_reason = ""
+        self._local_spam_last_fingerprint = ""
+        self._local_spam_repeat_count = 0
+
+    def _set_message_controls_enabled(self, enabled: bool):
+        self.message_input.setEnabled(enabled)
+        self.send_btn.setEnabled(enabled)
+
+    def _sync_message_block_state(self):
+        now_ts = time.time()
+        if now_ts < self.chat_blocked_until:
+            remain = max(1, int(self.chat_blocked_until - now_ts))
+            self._set_message_controls_enabled(False)
+            if self.chat_block_reason == "spam":
+                self.message_input.setPlaceholderText(f"Spam nedeniyle engellendi ({remain}s)")
+            else:
+                self.message_input.setPlaceholderText(f"Mesaj gönderme engellendi ({remain}s)")
+        else:
+            self.chat_blocked_until = 0.0
+            self.chat_block_reason = ""
+            self._set_message_controls_enabled(True)
+            self.message_input.setPlaceholderText("Type a message...")
+
+    def _is_alert_for_current_user(self, packet: dict) -> bool:
+        target_uid = str(packet.get("target_uid", "")).strip()
+        target_username = str(packet.get("target_username", "")).strip()
+        if target_uid and self.current_user_uid and target_uid == self.current_user_uid:
+            return True
+        if target_username:
+            current_name = (self.current_user_name or self.current_user_tag or "").strip()
+            return bool(current_name and target_username == current_name)
+        return False
+
+    def _register_local_spam_signal(self, fingerprint: str):
+        if not fingerprint:
+            return False
+
+        if fingerprint == self._local_spam_last_fingerprint:
+            self._local_spam_repeat_count += 1
+        else:
+            self._local_spam_last_fingerprint = fingerprint
+            self._local_spam_repeat_count = 1
+
+        if self._local_spam_repeat_count >= LOCAL_SPAM_THRESHOLD:
+            self.chat_blocked_until = time.time() + 30
+            self.chat_block_reason = "spam"
+            self.show_alert("[SPAM] Çok hızlı tekrar mesaj gönderiyorsun. 30s engellendi.", duration_ms=5000)
+            self._sync_message_block_state()
+            return True
+
+        return False
+
     def load_user_data(self, uid, email, token=""):
         """Load user data"""
         self.current_user_uid = uid
@@ -770,6 +825,14 @@ class ChatWindow(QWidget):
             if packet_type == "alert":
                 alert_text = packet.get("text", "Alert!")
                 self.show_alert(alert_text, duration_ms=5000)
+                if self._is_alert_for_current_user(packet):
+                    self.chat_block_reason = str(packet.get("block_reason") or "")
+                    blocked_until = float(packet.get("blocked_until") or 0.0)
+                    if blocked_until <= 0:
+                        block_seconds = float(packet.get("block_seconds") or 0)
+                        blocked_until = time.time() + max(1.0, block_seconds)
+                    self.chat_blocked_until = blocked_until
+                    self._sync_message_block_state()
                 print(f"[ALERT] {alert_text}")
                 continue
 
@@ -787,6 +850,8 @@ class ChatWindow(QWidget):
 
             if sender_uid == self.current_chat_uid and receiver_uid == self.current_user_uid:
                 self.load_chat_messages()
+
+        self._sync_message_block_state()
 
     def refresh_contacts(self):
         """Refresh contact list"""
@@ -1128,6 +1193,16 @@ class ChatWindow(QWidget):
             QMessageBox.warning(self, "Error", "Please select a contact!")
             return
 
+        self._sync_message_block_state()
+        now_ts = time.time()
+        if now_ts < self.chat_blocked_until:
+            remain = int(self.chat_blocked_until - now_ts)
+            if self.chat_block_reason == "spam":
+                QMessageBox.warning(self, "Blocked", f"Spam nedeniyle mesaj gönderemezsiniz. Kalan süre: {remain}s")
+            else:
+                QMessageBox.warning(self, "Blocked", f"Mesaj gönderemezsiniz. Kalan süre: {remain}s")
+            return
+
         message = self.message_input.text().strip()
         if not message:
             return
@@ -1147,6 +1222,7 @@ class ChatWindow(QWidget):
                     to_send,
                     fingerprint=fingerprint,
                 )
+                self._register_local_spam_signal(fingerprint)
                 self.message_input.clear()
                 self.load_chat_messages()
             else:

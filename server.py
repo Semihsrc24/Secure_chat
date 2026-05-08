@@ -385,9 +385,13 @@ def handle_client(client_sock, addr):
                 alert_msg = {
                     "type": "alert",
                     "text": f"[SPAM/FLOOD] Engellendiz. Kalan sure: {remain}s",
+                    "target_uid": uid,
+                    "target_username": username,
+                    "block_reason": "blocked",
+                    "blocked_until": time.time() + remaining,
+                    "block_seconds": remain,
                 }
                 send_packet(client_sock, alert_msg)
-                broadcast(alert_msg)
                 logging.warning("BLOCKED user=%s ip=%s port=%s", username, addr[0], addr[1])
                 print(f"[BLOCKED] {username}: {remain}s remaining")
                 continue
@@ -414,9 +418,13 @@ def handle_client(client_sock, addr):
                 alert_msg = {
                     "type": "alert",
                     "text": f"[SPAM] {username} çok hızlı tekrar mesaj gönderiyor. {int(block_duration)}s engellendi.",
+                    "target_uid": uid,
+                    "target_username": username,
+                    "block_reason": "spam",
+                    "blocked_until": client_info["blocked_until"],
+                    "block_seconds": int(block_duration),
                 }
                 send_packet(client_sock, alert_msg)
-                broadcast(alert_msg)
                 logging.warning("SPAM_DETECTED user=%s ip=%s port=%s duration=%ds", username, addr[0], addr[1], int(block_duration))
                 print(f"[SPAM_DETECTED] {username}: blocked for {int(block_duration)}s")
                 continue
@@ -435,8 +443,13 @@ def handle_client(client_sock, addr):
                         f"Supheli aktivite: user={client_info['name']} "
                         f"reason={reason} block={BLOCK_SECONDS}s"
                     ),
+                    "target_uid": uid,
+                    "target_username": username,
+                    "block_reason": "suspicious",
+                    "blocked_until": client_info["blocked_until"],
+                    "block_seconds": BLOCK_SECONDS,
                 }
-                broadcast(alert_text)
+                send_packet(client_sock, alert_text)
                 logging.warning(
                     "ALERT user=%s ip=%s port=%s reason=%s",
                     client_info["name"],
