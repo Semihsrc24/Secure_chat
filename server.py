@@ -127,8 +127,14 @@ def check_brute_force_login(username):
         last_failed_login_time[username] = now_ts
         
         if failed_logins[username] >= FAILED_LOGIN_THRESHOLD:
-            add_to_block_list(username, block_level=1)
-            return True
+                add_to_block_list(username, block_level=1)
+                # Log to detection.log
+                try:
+                    with open("detection.log", "a", encoding="utf-8") as df:
+                        df.write(f"{datetime.utcnow().isoformat()} - BRUTE_FORCE detected - user={username} failed={failed_logins[username]}\n")
+                except Exception:
+                    pass
+                return True
     return False
 
 
@@ -157,6 +163,12 @@ def check_repeated_message(username, current_msg):
         add_to_block_list(username, block_level=current_block_level)
         with repeat_count_lock:
             repeat_count[username] = 0  # Reset after block
+        # Log spam detection
+        try:
+            with open("detection.log", "a", encoding="utf-8") as df:
+                df.write(f"{datetime.utcnow().isoformat()} - SPAM detected - user={username} repeat_count={current_repeat} key={str(current_msg)[:64]}\n")
+        except Exception:
+            pass
         return True
     return False
 
@@ -449,6 +461,12 @@ def handle_client(client_sock, addr):
                     "blocked_until": client_info["blocked_until"],
                     "block_seconds": BLOCK_SECONDS,
                 }
+                # Log suspicious activity to detection.log
+                try:
+                    with open("detection.log", "a", encoding="utf-8") as df:
+                        df.write(f"{datetime.utcnow().isoformat()} - SUSPICIOUS activity - user={username} reason={reason}\n")
+                except Exception:
+                    pass
                 send_packet(client_sock, alert_text)
                 logging.warning(
                     "ALERT user=%s ip=%s port=%s reason=%s",
