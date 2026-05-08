@@ -9,6 +9,7 @@ from collections import deque
 
 HOST = "0.0.0.0"
 PORT = 5555
+ADMIN_PORT = 5001
 BUFFER_SIZE = 2048
 
 RATE_LIMIT_MESSAGES = 10
@@ -38,11 +39,40 @@ repeat_count_lock = threading.Lock()  # Thread-safe access to repeat_count/last_
 block_list = {}  # {username: {"blocked_until": timestamp, "block_level": 1}}
 block_list_lock = threading.Lock()
 
+# RTT Measurement and Metrics
+admin_clients = {}  # {socket: {"connected_at": timestamp}}
+admin_clients_lock = threading.Lock()
+rtt_measurements = []  # List of RTT values for averaging
+rtt_lock = threading.Lock()
+METRICS_FILE = "rtt_metrics.csv"
+
 FAILED_LOGIN_THRESHOLD = 3
 FAILED_LOGIN_BLOCK_SECONDS = 60
 REPEAT_MESSAGE_THRESHOLD = 5  # Changed from 10 to 5 for faster spam detection
 INITIAL_BLOCK_SECONDS = 30
 BLOCK_RESET_HOURS = 24
+
+
+def init_metrics_file():
+    """Initialize RTT metrics CSV file with headers if not exists."""
+    try:
+        if not os.path.exists(METRICS_FILE):
+            with open(METRICS_FILE, "w", encoding="utf-8") as f:
+                f.write("timestamp,rtt_ms,client_count,total_messages\n")
+    except Exception:
+        pass
+
+
+def write_metrics(rtt_ms: float):
+    """Append RTT measurement to CSV."""
+    try:
+        with clients_lock:
+            client_count = len(clients)
+            total_msgs = server_stats["total_messages"]
+        with open(METRICS_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.utcnow().isoformat()},{rtt_ms:.2f},{client_count},{total_msgs}\n")
+    except Exception:
+        pass
 
 
 def write_socket_endpoint(host, port, source="unknown"):
@@ -511,6 +541,110 @@ def handle_client(client_sock, addr):
             pass
 
 
+def handle_admin_client(admin_sock, addr):
+    """Handle admin dashboard connection for RTT monitoring and metrics."""
+    with admin_clients_lock:
+        admin_clients[admin_sock] = {"connected_at": time.time()}
+    
+    print(f"[ADMIN] Connection accepted from {addr[0]}:{addr[1]}")
+    logging.info("ADMIN_CONNECT ip=%s port=%s", addr[0], addr[1])
+    
+    try:
+        admin_sock.settimeout(60)
+        while running:
+            try:
+                data = admin_sock.recv(BUFFER_SIZE).decode("utf-8").strip()
+                if not data:
+                    break
+                
+                command = json.loads(data)
+                action = command.get("action", "").strip()
+                
+                if action == "measure_rtt":
+                    # Send ping to all main chat clients
+                    start_time = time.time()
+                    
+                    # Broadcast ping to all connected clients
+                    with clients_lock:
+                        client_socks = list(clients.keys())
+                    
+                    if client_socks:
+                        ping_packet = {"type": "ping"}
+                        for client_sock in client_socks:
+                            try:
+                                send_packet(client_sock, ping_packet)
+                            except Exception:
+                                pass
+                        
+                        # Simple RTT: measure time spent sending pings
+                        end_time = time.time()
+                        rtt_ms = (end_time - start_time) * 1000
+                    else:
+                        rtt_ms = 0
+                    
+                    # Record measurement
+                    with rtt_lock:
+                        rtt_measurements.append(rtt_ms)
+                        if len(rtt_measurements) > 100:  # Keep last 100 measurements
+                            rtt_measurements.pop(0)
+                        avg_rtt = sum(rtt_measurements) / len(rtt_measurements)
+                    
+                    write_metrics(rtt_ms)
+                    
+                    # Send result back to admin
+                    result = {
+                        "type": "RTT_UPDATE",
+                        "value": rtt_ms,
+                        "average": avg_rtt,
+                        "client_count": len(client_socks),
+                    }
+                    admin_sock.sendall((json.dumps(result) + "\n").encode("utf-8"))
+                    
+                    print(f"[ADMIN] RTT measured: {rtt_ms:.2f}ms (avg: {avg_rtt:.2f}ms)")
+                    logging.info("RTT_MEASUREMENT rtt_ms=%.2f avg_ms=%.2f", rtt_ms, avg_rtt)
+                
+                elif action == "get_stats":
+                    # Return current server statistics
+                    with clients_lock:
+                        client_count = len(clients)
+                        total_msgs = server_stats["total_messages"]
+                        total_alerts = server_stats["total_alerts"]
+                    
+                    with rtt_lock:
+                        avg_rtt = sum(rtt_measurements) / len(rtt_measurements) if rtt_measurements else 0
+                    
+                    stats = {
+                        "type": "STATS_UPDATE",
+                        "client_count": client_count,
+                        "total_messages": total_msgs,
+                        "total_alerts": total_alerts,
+                        "avg_rtt": avg_rtt,
+                    }
+                    admin_sock.sendall((json.dumps(stats) + "\n").encode("utf-8"))
+                
+            except socket.timeout:
+                continue
+            except json.JSONDecodeError:
+                continue
+            except Exception as exc:
+                print(f"[ADMIN] Error: {exc}")
+                break
+    
+    except Exception as exc:
+        print(f"[ADMIN] Connection error from {addr}: {exc}")
+        logging.exception("ADMIN_ERROR ip=%s port=%s", addr[0], addr[1])
+    
+    finally:
+        with admin_clients_lock:
+            admin_clients.pop(admin_sock, None)
+        try:
+            admin_sock.close()
+        except Exception:
+            pass
+        print(f"[ADMIN] Disconnected {addr[0]}:{addr[1]}")
+        logging.info("ADMIN_DISCONNECT ip=%s port=%s", addr[0], addr[1])
+
+
 def maybe_start_ngrok(local_port):
     
     use_ngrok = os.getenv("USE_PYNGROK", "1").strip() != "0"
@@ -553,14 +687,22 @@ def main():
         ],
     )
 
+    init_metrics_file()
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(50)
 
+    admin_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    admin_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    admin_server.bind((HOST, ADMIN_PORT))
+    admin_server.listen(10)
+
     print("=" * 45)
     print("  PYTHON CHAT SERVER")
     print(f"  Dinleniyor: {HOST}:{PORT}")
+    print(f"  Admin Dashboard: {HOST}:{ADMIN_PORT}")
     print("  Komutlar client tarafindan gonderilir: /quit /list /nick")
     print("=" * 45)
 
@@ -573,6 +715,21 @@ def main():
         write_socket_endpoint(local_host, PORT, source="local")
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
+
+    def admin_accept_loop():
+        while running:
+            try:
+                admin_sock, addr = admin_server.accept()
+                t = threading.Thread(target=handle_admin_client, args=(admin_sock, addr), daemon=True)
+                t.start()
+            except OSError:
+                # Server socket closed
+                break
+            except Exception as exc:
+                print(f"[ADMIN] Accept error: {exc}")
+
+    admin_thread = threading.Thread(target=admin_accept_loop, daemon=True)
+    admin_thread.start()
 
     try:
         while True:
@@ -590,7 +747,15 @@ def main():
                 s.close()
             except Exception:
                 pass
+        with admin_clients_lock:
+            admin_socks = list(admin_clients.keys())
+        for s in admin_socks:
+            try:
+                s.close()
+            except Exception:
+                pass
         server.close()
+        admin_server.close()
 
 
 if __name__ == "__main__":
