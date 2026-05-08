@@ -391,8 +391,11 @@ def handle_client(client_sock, addr):
                 continue
 
             # Check for repeated message spam
-            print(f"[SPAM_CHECK] user={username} msg='{text[:30]}'")
-            if check_repeated_message(username, text):
+            # Prefer fingerprint if client provided it (SHA256 of plaintext), otherwise use raw text
+            fingerprint = packet.get("fingerprint") if isinstance(packet, dict) else None
+            check_val = fingerprint or text
+            print(f"[SPAM_CHECK] user={username} key='{(check_val[:30] if isinstance(check_val, str) else str(check_val))}'")
+            if check_repeated_message(username, check_val):
                 client_info["alerts"] += 1
                 with clients_lock:
                     server_stats["total_alerts"] += 1

@@ -6,6 +6,8 @@ import json
 import socket
 import queue
 import threading
+import time
+import hashlib
 import html
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -173,15 +175,18 @@ class SocketChatClient:
         except Exception as exc:
             self.event_queue.put({"type": "connection", "connected": False, "error": str(exc)})
 
-    def send_message(self, sender_uid: str, sender_name: str, receiver_uid: str, text: str) -> None:
-        self._send_packet({
+    def send_message(self, sender_uid: str, sender_name: str, receiver_uid: str, text: str, fingerprint: str = None) -> None:
+        payload = {
             "type": "message",
             "sender_uid": sender_uid,
             "sender_name": sender_name,
             "receiver_uid": receiver_uid,
             "text": text,
             "timestamp": datetime.now().isoformat(),
-        })
+        }
+        if fingerprint:
+            payload["fingerprint"] = fingerprint
+        self._send_packet(payload)
 
     def _receive_loop(self) -> None:
         try:
@@ -252,8 +257,13 @@ class LoginWindow(QWidget):
         super().__init__(parent)
         self.parent_window = parent
         self._login_in_progress = False
+        # Brute-force login tracking (client-side) per-account
+        self.failed_login_counts = {}  # email -> count
+        self.login_blocked_untils = {}  # email -> timestamp
+        self.failed_login_reset_time = {}  # email -> timestamp (optional)
         self.login_result.connect(self._on_login_result)
         self.init_ui()
+        
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -352,6 +362,14 @@ class LoginWindow(QWidget):
         email = self.login_email.text().strip()
         password = self.login_password.text()
 
+        # Check client-side login block for this email
+        now_ts = time.time()
+        blocked_until = self.login_blocked_untils.get(email, 0)
+        if now_ts < blocked_until:
+            remain = int(blocked_until - now_ts)
+            QMessageBox.warning(self, "Blocked", f"Too many failed attempts for this account. Try again in {remain}s")
+            return
+
         if not email or not password:
             QMessageBox.warning(self, "Error", "Email and password required!")
             return
@@ -380,8 +398,27 @@ class LoginWindow(QWidget):
 
         if result.get("success"):
             email = result.get("email") or self.login_email.text().strip()
+            # Reset failed login tracking on success for this account
+            try:
+                self.failed_login_counts[email] = 0
+                self.login_blocked_untils[email] = 0.0
+            except Exception:
+                pass
             self.parent_window.login(result.get("uid", ""), email, result.get("token", ""))
             return
+
+        # On failure, increment failed count for this email and possibly block for 5 minutes
+        try:
+            email = result.get("email") or self.login_email.text().strip()
+            count = self.failed_login_counts.get(email, 0) + 1
+            self.failed_login_counts[email] = count
+            if count >= 5:
+                self.login_blocked_untils[email] = time.time() + 300  # 5 minutes
+                self.failed_login_counts[email] = 0
+                QMessageBox.warning(self, "Blocked", "Too many incorrect attempts for this account. Login blocked for 5 minutes.")
+                return
+        except Exception:
+            pass
 
         QMessageBox.warning(self, "Error", result.get("message", "Login failed"))
 
@@ -1096,15 +1133,19 @@ class ChatWindow(QWidget):
             return
 
         try:
+            # compute fingerprint from plaintext so server can detect repeats
+            fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()
             to_send = _encrypt_text_if_needed(message)
             success = firebase.send_message(self.current_user_uid, self.current_chat_uid, to_send)
 
             if success:
+                # include fingerprint in real-time socket packet for spam detection
                 self.socket_client.send_message(
                     self.current_user_uid,
                     self.current_user_name or self.current_user_tag or self.current_user_uid,
                     self.current_chat_uid,
                     to_send,
+                    fingerprint=fingerprint,
                 )
                 self.message_input.clear()
                 self.load_chat_messages()
