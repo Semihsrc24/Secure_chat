@@ -1,8 +1,4 @@
-"""
-Secure Chat - PySide6 GUI
-Mobile-style login, signup, contacts list and chat screens.
-All visible text is in English and UI is restyled for a mobile look.
-"""
+
 
 import sys
 import os
@@ -21,10 +17,109 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
 from PySide6.QtGui import QFont, QIcon, QPixmap, QColor, QTextCursor, QTextBlockFormat
 from firebase_config import firebase
+# Fernet key handling: either from env `FERNET_KEY`, from `fernet.key`,
+# or generated once and written to `fernet.key` for convenience.
 
-# Direct ngrok defaults (hardcoded to avoid env pollution)
-SOCKET_HOST = os.getenv("CHAT_SOCKET_HOST", "6.tcp.ngrok.io")
-SOCKET_PORT = int(os.getenv("CHAT_SOCKET_PORT", "15598"))
+FERNET = None
+try:
+    from cryptography.fernet import Fernet
+    _fkey = os.getenv("FERNET_KEY", "").strip()
+    if not _fkey:
+        if os.path.exists("fernet.key"):
+            try:
+                with open("fernet.key", "r", encoding="utf-8") as fk:
+                    _fkey = fk.read().strip()
+            except Exception:
+                _fkey = ""
+
+    # If no key provided or found, generate one and persist to fernet.key (ONLY if file doesn't exist)
+    if not _fkey:
+        if not os.path.exists("fernet.key"):
+            try:
+                _fkey = Fernet.generate_key().decode()
+                try:
+                    with open("fernet.key", "w", encoding="utf-8") as fk:
+                        fk.write(_fkey)
+                    print("[SEC] Yeni fernet.key oluşturuldu ve kaydedildi")
+                except Exception as e:
+                    print(f"[SEC] fernet.key kaydedilemedi: {e}")
+            except Exception as e:
+                print(f"[SEC] Fernet anahtari olusturulamadi: {e}")
+                _fkey = ""
+
+    if _fkey:
+        try:
+            FERNET = Fernet(_fkey.encode() if isinstance(_fkey, str) else _fkey)
+            print("[SEC] Fernet aktif")
+        except Exception as e:
+            print(f"[SEC] Fernet anahtari ile baslatilamadi: {e}")
+    else:
+        print("[SEC] Fernet anahtari bulunamadi; sifreleme devre disi.")
+except Exception:
+    print("[SEC] cryptography kütüphanesi yok veya import edilemedi; Fernet devre disi.")
+
+
+def _encrypt_text_if_needed(text: str) -> str:
+    if not FERNET or not isinstance(text, str) or not text:
+        return text
+    try:
+        token = FERNET.encrypt(text.encode("utf-8"))
+        return f"enc:v1:{token.decode('utf-8')}"
+    except Exception:
+        return text
+
+
+def _maybe_decrypt_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    if not text.startswith("enc:v1:"):
+        return text
+    if not FERNET:
+        return "[Encrypted message - no key available]"
+    try:
+        token = text.split(":", 2)[2]
+        plain = FERNET.decrypt(token.encode("utf-8"))
+        return plain.decode("utf-8")
+    except Exception:
+        # Decryption failed (likely wrong/missing key or corrupted token).
+        # Show a clearer message so user can troubleshoot key sync.
+        return "[Encrypted message could not be decrypted]"
+
+
+def _normalize_host(raw_host: str) -> str:
+    host = str(raw_host or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    return host.rstrip("/")
+
+
+def _load_socket_config_from_file(file_path: str = "socket_endpoint.json"):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        host = _normalize_host(data.get("host", ""))
+        port = int(data.get("port", 0))
+        if host and port > 0:
+            return host, port
+    except Exception:
+        pass
+    return None
+
+
+# Priority: env vars > socket_endpoint.json > fallback
+_env_host = _normalize_host(os.getenv("CHAT_SOCKET_HOST", ""))
+_env_port = os.getenv("CHAT_SOCKET_PORT", "").strip()
+
+if _env_host and _env_port:
+    SOCKET_HOST = _env_host
+    SOCKET_PORT = int(_env_port)
+else:
+    file_cfg = _load_socket_config_from_file()
+    if file_cfg:
+        SOCKET_HOST, SOCKET_PORT = file_cfg
+    else:
+        SOCKET_HOST = _normalize_host("tcp://2.tcp.ngrok.io")
+        SOCKET_PORT = 29718
 
 print(f"[CONFIG] CHAT_SOCKET_HOST={SOCKET_HOST} CHAT_SOCKET_PORT={SOCKET_PORT}")
 
@@ -40,14 +135,18 @@ class SocketChatClient:
         self.reader = None
         self.running = False
         self.thread = None
+        self._sock_lock = threading.Lock()
 
     def connect(self, uid: str, username: str, token: str = "") -> bool:
         self.disconnect(close_only=True)
 
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
+            with self._sock_lock:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(8)
+                self.sock.connect((self.host, self.port))
+                self.sock.settimeout(None)
+                self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
             self.running = True
             self._send_packet({
                 "type": "auth",
@@ -65,10 +164,14 @@ class SocketChatClient:
             return False
 
     def _send_packet(self, payload: dict) -> None:
-        if not self.sock:
-            return
         message = json.dumps(payload, ensure_ascii=False) + "\n"
-        self.sock.sendall(message.encode("utf-8"))
+        try:
+            with self._sock_lock:
+                if not self.sock:
+                    return
+                self.sock.sendall(message.encode("utf-8"))
+        except Exception as exc:
+            self.event_queue.put({"type": "connection", "connected": False, "error": str(exc)})
 
     def send_message(self, sender_uid: str, sender_name: str, receiver_uid: str, text: str) -> None:
         self._send_packet({
@@ -98,7 +201,9 @@ class SocketChatClient:
 
                 self.event_queue.put(packet)
         except Exception as exc:
-            if self.running:
+            # Ignore expected operation-on-closed-socket noise during disconnect/reconnect.
+            is_win_10038 = isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10038
+            if self.running and not is_win_10038:
                 self.event_queue.put({"type": "connection", "connected": False, "error": str(exc)})
         finally:
             self.running = False
@@ -108,19 +213,20 @@ class SocketChatClient:
     def disconnect(self, close_only: bool = False) -> None:
         self.running = False
 
-        try:
-            if self.reader:
-                self.reader.close()
-        except Exception:
-            pass
-        self.reader = None
+        with self._sock_lock:
+            try:
+                if self.reader:
+                    self.reader.close()
+            except Exception:
+                pass
+            self.reader = None
 
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
         if not close_only:
             self.event_queue.put({"type": "connection", "connected": False})
@@ -129,16 +235,24 @@ class SocketChatClient:
 class MessageSignals(QObject):
     """Message signals"""
     new_message = Signal(str, str, str)
-    chat_updated = Signal()
+    # chat_updated: emits dict {users, friends, recent_chats}
+    chat_updated = Signal(dict)
+    # chat_loaded: emits dict {messages, other_username}
+    chat_loaded = Signal(dict)
+    # profile_loaded: emits dict {uid, name, tag}
+    profile_loaded = Signal(dict)
     connection_changed = Signal(bool)
 
 
 class LoginWindow(QWidget):
     """Login / Signup screen (mobile style)"""
+    login_result = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_window = parent
+        self._login_in_progress = False
+        self.login_result.connect(self._on_login_result)
         self.init_ui()
 
     def init_ui(self):
@@ -232,6 +346,9 @@ class LoginWindow(QWidget):
         )
 
     def handle_login(self):
+        if self._login_in_progress:
+            return
+
         email = self.login_email.text().strip()
         password = self.login_password.text()
 
@@ -239,15 +356,34 @@ class LoginWindow(QWidget):
             QMessageBox.warning(self, "Error", "Email and password required!")
             return
 
-        try:
-            result = firebase.login_user(email, password)
-            if result["success"]:
-                QMessageBox.information(self, "Success", "Login successful!")
-                self.parent_window.login(result["uid"], email, result.get("token", ""))
-            else:
-                QMessageBox.warning(self, "Error", result["message"])
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Login error: {str(e)}")
+        self._login_in_progress = True
+        self.login_btn.setEnabled(False)
+        self.login_btn.setText("Logging in...")
+
+        def _login_worker(user_email, user_password):
+            try:
+                result = firebase.login_user(user_email, user_password)
+                if isinstance(result, dict):
+                    result["email"] = user_email
+                    self.login_result.emit(result)
+                else:
+                    self.login_result.emit({"success": False, "message": "Invalid login response", "email": user_email})
+            except Exception as e:
+                self.login_result.emit({"success": False, "message": f"Login error: {str(e)}", "email": user_email})
+
+        threading.Thread(target=_login_worker, args=(email, password), daemon=True).start()
+
+    def _on_login_result(self, result: dict):
+        self._login_in_progress = False
+        self.login_btn.setEnabled(True)
+        self.login_btn.setText("Log In")
+
+        if result.get("success"):
+            email = result.get("email") or self.login_email.text().strip()
+            self.parent_window.login(result.get("uid", ""), email, result.get("token", ""))
+            return
+
+        QMessageBox.warning(self, "Error", result.get("message", "Login failed"))
 
     def handle_signup(self):
         username = self.signup_username.text().strip()
@@ -290,6 +426,14 @@ class ChatWindow(QWidget):
         self.current_user_token = ""
         self.message_queue = queue.Queue()
         self.socket_client = SocketChatClient(SOCKET_HOST, SOCKET_PORT, self.message_queue)
+        # signals for background thread results
+        self.signals = MessageSignals()
+        self.signals.chat_updated.connect(self._apply_contacts)
+        self.signals.chat_loaded.connect(self._apply_chat_messages)
+        self.signals.profile_loaded.connect(self._apply_user_profile)
+        self._refresh_thread = None
+        self._load_chat_thread = None
+        self._socket_connect_thread = None
         self.init_ui()
 
     def init_ui(self):
@@ -487,19 +631,26 @@ class ChatWindow(QWidget):
 
         self.socket_timer = QTimer()
         self.socket_timer.timeout.connect(self.process_socket_events)
-        self.socket_timer.start(150)
+        self.socket_timer.start(300)
 
     def load_user_data(self, uid, email, token=""):
         """Load user data"""
         self.current_user_uid = uid
         self.current_user_token = token or ""
-        try:
-            profile = firebase.get_user_profile(uid)
-            self.current_user_name = profile.get("username", email.split("@")[0])
-            self.current_user_tag = profile.get("tag") or profile.get("username", email.split("@")[0])
-        except:
-            self.current_user_name = email.split("@")[0]
-            self.current_user_tag = self.current_user_name
+        fallback_name = email.split("@")[0]
+        self.current_user_name = fallback_name
+        self.current_user_tag = fallback_name
+
+        def _fetch_profile(user_uid, default_name):
+            try:
+                profile = firebase.get_user_profile(user_uid)
+                name = profile.get("username", default_name)
+                tag = profile.get("tag") or name
+                self.signals.profile_loaded.emit({"uid": user_uid, "name": name, "tag": tag})
+            except Exception as e:
+                print(f"Profile load error: {e}")
+
+        threading.Thread(target=_fetch_profile, args=(uid, fallback_name), daemon=True).start()
 
         self.user_tag_label.setText(f"Your tag: {self.current_user_tag}")
         self.invite_code_label.setText(f"Invite code: {uid}")
@@ -507,21 +658,36 @@ class ChatWindow(QWidget):
         if not self.update_timer.isActive():
             self.update_timer.start(3000)
         if not self.socket_timer.isActive():
-            self.socket_timer.start(150)
+            self.socket_timer.start(300)
         self.connect_socket()
         self.refresh_contacts()
+
+    def _apply_user_profile(self, data: dict):
+        uid = data.get("uid")
+        if uid != self.current_user_uid:
+            return
+        self.current_user_name = data.get("name") or self.current_user_name
+        self.current_user_tag = data.get("tag") or self.current_user_tag
+        self.user_tag_label.setText(f"Your tag: {self.current_user_tag}")
 
     def connect_socket(self):
         if not self.current_user_uid:
             return
 
-        connected = self.socket_client.connect(
-            self.current_user_uid,
-            self.current_user_name or self.current_user_tag or self.current_user_uid,
-            self.current_user_token,
-        )
-        if not connected:
-            print(f"Socket connection failed: {SOCKET_HOST}:{SOCKET_PORT}")
+        if self._socket_connect_thread and self._socket_connect_thread.is_alive():
+            return
+
+        uid = self.current_user_uid
+        name = self.current_user_name or self.current_user_tag or self.current_user_uid
+        token = self.current_user_token
+
+        def _connect():
+            connected = self.socket_client.connect(uid, name, token)
+            if not connected:
+                print(f"Socket connection failed: {SOCKET_HOST}:{SOCKET_PORT}")
+
+        self._socket_connect_thread = threading.Thread(target=_connect, daemon=True)
+        self._socket_connect_thread.start()
 
     def process_socket_events(self):
         while True:
@@ -560,23 +726,65 @@ class ChatWindow(QWidget):
         """Refresh contact list"""
         if not self.current_user_uid:
             return
+        # perform firebase operations in a background thread to avoid UI blocking
+        if self._refresh_thread and getattr(self._refresh_thread, "is_alive", lambda: False)():
+            return
 
+        def _fetch():
+            try:
+                users = firebase.get_all_users(self.current_user_uid)
+                friends = firebase.get_friends(self.current_user_uid)
+                recent_chats = firebase.get_recent_chats(self.current_user_uid)
+                self.signals.chat_updated.emit({
+                    "users": users,
+                    "friends": friends,
+                    "recent_chats": recent_chats,
+                })
+            except Exception as e:
+                print(f"Contact load error: {e}")
+
+        self._refresh_thread = threading.Thread(target=_fetch, daemon=True)
+        self._refresh_thread.start()
+
+    def _apply_contacts(self, data: dict):
         try:
-            users = firebase.get_all_users(self.current_user_uid)
-            friends = firebase.get_friends(self.current_user_uid)
-            recent_chats = firebase.get_recent_chats(self.current_user_uid)
+            users = data.get("users", {}) or {}
+            friends = data.get("friends", {}) or {}
+            recent_chats = data.get("recent_chats", {}) or {}
 
             self.contact_list.clear()
 
-            for uid, user_info in users.items():
+            # Only show friends in the left-side chats list. friends can be dict or iterable.
+            friend_ids = set()
+            if friends:
+                try:
+                    friend_ids = set(friends.keys())
+                except Exception:
+                    try:
+                        friend_ids = set(friends)
+                    except Exception:
+                        friend_ids = set()
+
+            if not friend_ids:
+                # no friends yet; show a placeholder item that opens Add Friend on click
+                placeholder = QListWidgetItem("Arkadaş ekle")
+                placeholder.setData(Qt.UserRole, None)
+                placeholder.setToolTip("Henüz arkadaşınız yok. Arkadaş eklemek için tıklayın.")
+                placeholder.setForeground(QColor("#777777"))
+                f = placeholder.font()
+                f.setItalic(True)
+                placeholder.setFont(f)
+                self.contact_list.addItem(placeholder)
+                return
+
+            for uid in sorted(friend_ids):
+                user_info = users.get(uid, {})
                 username = user_info.get("username", "Unknown")
                 tag = user_info.get("tag", "")
                 status = user_info.get("status", "offline")
                 unread = recent_chats.get(uid, {}).get("unread", 0)
 
                 item_text = tag or username
-                if friends and uid in friends:
-                    item_text = f"★ {item_text}"
                 if unread > 0:
                     item_text += f" ({unread})"
 
@@ -591,11 +799,17 @@ class ChatWindow(QWidget):
 
                 self.contact_list.addItem(item)
         except Exception as e:
-            print(f"Contact load error: {e}")
+            print(f"Contact UI update error: {e}")
 
     def on_contact_selected(self, item):
         """When a contact is selected"""
-        self.current_chat_uid = item.data(Qt.UserRole)
+        uid = item.data(Qt.UserRole)
+        if not uid:
+            # placeholder clicked -> open add friend dialog
+            self.handle_add_friend()
+            return
+
+        self.current_chat_uid = uid
         username = item.text().split(" (")[0]
 
         self.chat_name_label.setText(f"💬 {username}")
@@ -755,16 +969,41 @@ class ChatWindow(QWidget):
         """Load chat messages"""
         if not self.current_chat_uid:
             return
+        # load messages in background to avoid UI freeze
+        if self._load_chat_thread and getattr(self._load_chat_thread, "is_alive", lambda: False)():
+            return
 
+        def _fetch_chat():
+            try:
+                firebase.mark_messages_as_read(self.current_chat_uid, self.current_user_uid)
+                messages = firebase.get_chat_messages(self.current_user_uid, self.current_chat_uid)
+                other_user = firebase.get_user_profile(self.current_chat_uid)
+                other_username = other_user.get("username", "Unknown")
+                self.signals.chat_loaded.emit({"messages": messages, "other_username": other_username})
+            except Exception as e:
+                print(f"Message load error: {e}")
+
+        self._load_chat_thread = threading.Thread(target=_fetch_chat, daemon=True)
+        self._load_chat_thread.start()
+
+    def _apply_chat_messages(self, data: dict):
         try:
-            firebase.mark_messages_as_read(self.current_chat_uid, self.current_user_uid)
-            messages = firebase.get_chat_messages(self.current_user_uid, self.current_chat_uid)
+            messages = data.get("messages", []) or []
+            other_username = data.get("other_username", "Unknown")
             self.chat_display.clear()
 
-            other_user = firebase.get_user_profile(self.current_chat_uid)
-            other_username = other_user.get("username", "Unknown")
+            # Remove exact duplicates (same Firebase id or identical sender+timestamp+text)
+            unique_messages = []
+            seen_keys = set()
+            for m in messages:
+                mid = m.get("id") or ""
+                key = mid if mid else f"{m.get('sender','')}|{m.get('timestamp','')}|{m.get('text','') }"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                unique_messages.append(m)
 
-            for msg in messages:
+            for msg in unique_messages:
                 sender_uid = (msg.get("sender") or "").strip()
                 text = msg.get("text", "")
                 timestamp = msg.get("timestamp", "")
@@ -776,7 +1015,12 @@ class ChatWindow(QWidget):
                 except:
                     time_str = ""
 
-                safe_text = html.escape(text).replace("\n", "<br>")
+                # Attempt to decrypt if message is encrypted
+                try:
+                    display_text = _maybe_decrypt_text(text)
+                except Exception:
+                    display_text = text
+                safe_text = html.escape(display_text).replace("\n", "<br>")
                 safe_other_username = html.escape(other_username)
 
                 is_own_message = sender_uid == current_uid
@@ -809,9 +1053,8 @@ class ChatWindow(QWidget):
                 self.chat_display.setTextCursor(cursor)
 
             self.chat_display.moveCursor(QTextCursor.End)
-
         except Exception as e:
-            print(f"Message load error: {e}")
+            print(f"Message UI update error: {e}")
 
     def send_message(self):
         """Send message"""
@@ -824,14 +1067,15 @@ class ChatWindow(QWidget):
             return
 
         try:
-            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, message)
+            to_send = _encrypt_text_if_needed(message)
+            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, to_send)
 
             if success:
                 self.socket_client.send_message(
                     self.current_user_uid,
                     self.current_user_name or self.current_user_tag or self.current_user_uid,
                     self.current_chat_uid,
-                    message,
+                    to_send,
                 )
                 self.message_input.clear()
                 self.load_chat_messages()
@@ -842,11 +1086,30 @@ class ChatWindow(QWidget):
 
     def handle_logout(self):
         """Logout"""
+        uid = self.current_user_uid
+
         self.update_timer.stop()
         self.socket_timer.stop()
-        self.socket_client.disconnect()
-        firebase.update_user_status(self.current_user_uid, "offline")
+
+        # Switch UI immediately; run network cleanup in background
         self.parent_window.logout()
+
+        def _background_cleanup(user_uid):
+            try:
+                self.socket_client.disconnect()
+            except Exception as e:
+                print(f"Logout socket cleanup error: {e}")
+
+            try:
+                if user_uid:
+                    firebase.update_user_status(user_uid, "offline")
+            except Exception as e:
+                print(f"Logout status update error: {e}")
+
+        try:
+            threading.Thread(target=_background_cleanup, args=(uid,), daemon=True).start()
+        except Exception as e:
+            print(f"Logout cleanup thread error: {e}")
 
 
 class ChatApp(QMainWindow):
@@ -878,9 +1141,17 @@ class ChatApp(QMainWindow):
 
     def login(self, uid, email, token=""):
         """Log in"""
-        firebase.update_user_status(uid, "online")
         self.chat_window.load_user_data(uid, email, token)
         self.show_chat()
+
+        def _set_online(user_uid):
+            try:
+                if user_uid:
+                    firebase.update_user_status(user_uid, "online")
+            except Exception as e:
+                print(f"Login status update error: {e}")
+
+        threading.Thread(target=_set_online, args=(uid,), daemon=True).start()
 
     def logout(self):
         """Log out"""

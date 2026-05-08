@@ -26,6 +26,22 @@ server_stats = {
     "total_alerts": 0,
 }
 running = True
+ENDPOINT_FILE = "socket_endpoint.json"
+
+
+def write_socket_endpoint(host, port, source="unknown"):
+    payload = {
+        "host": str(host).strip(),
+        "port": int(port),
+        "source": source,
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        with open(ENDPOINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[CONFIG] Socket endpoint yazildi: {payload['host']}:{payload['port']} ({source})")
+    except Exception as exc:
+        print(f"[CONFIG] Socket endpoint dosyasi yazilamadi: {exc}")
 
 
 def send_packet(sock, payload):
@@ -331,16 +347,17 @@ def handle_client(client_sock, addr):
 
 
 def maybe_start_ngrok(local_port):
-    use_ngrok = os.getenv("USE_PYNGROK", "0").strip() == "1"
+    
+    use_ngrok = os.getenv("USE_PYNGROK", "1").strip() != "0"
     if not use_ngrok:
-        print("[NGROK] Pyngrok otomatik acilis kapali (USE_PYNGROK=1 yaparsan acilir).")
-        return
+        print("[NGROK] Pyngrok otomatik acilis kapali (USE_PYNGROK=0 yaparsan kapatilir).")
+        return None
 
     try:
         from pyngrok import ngrok
     except ImportError:
         print("[NGROK] pyngrok kurulu degil. Kurulum: pip install pyngrok")
-        return
+        return None
 
     token = os.getenv("NGROK_AUTHTOKEN", "").strip()
     if token:
@@ -349,8 +366,14 @@ def maybe_start_ngrok(local_port):
     try:
         tunnel = ngrok.connect(addr=local_port, proto="tcp")
         print(f"[NGROK] Public TCP URL: {tunnel.public_url}")
+        public_url = str(tunnel.public_url).strip()
+        # format expected: tcp://host:port
+        endpoint = public_url.split("://", 1)[1] if "://" in public_url else public_url
+        host, port_text = endpoint.rsplit(":", 1)
+        return host.strip(), int(port_text.strip())
     except Exception as exc:
         print(f"[NGROK] Tunnel acilamadi: {exc}")
+        return None
 
 
 def main():
@@ -376,7 +399,13 @@ def main():
     print("  Komutlar client tarafindan gonderilir: /quit /list /nick")
     print("=" * 45)
 
-    maybe_start_ngrok(PORT)
+    ngrok_endpoint = maybe_start_ngrok(PORT)
+    if ngrok_endpoint:
+        write_socket_endpoint(ngrok_endpoint[0], ngrok_endpoint[1], source="ngrok")
+    else:
+        # Local fallback for same-machine development
+        local_host = os.getenv("LOCAL_SOCKET_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        write_socket_endpoint(local_host, PORT, source="local")
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 

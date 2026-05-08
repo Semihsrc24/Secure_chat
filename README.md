@@ -36,8 +36,8 @@ python -m venv .venv
 2. Install dependencies:
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 3. (Optional) Place Firebase credentials at the project root as `serviceAccountKey.json` to enable full Firebase functionality.
@@ -47,13 +47,19 @@ python -m pip install -r requirements.txt
 Start the server (on the host machine):
 
 ```powershell
-python server.py
+.venv\Scripts\python.exe server.py
 ```
 
 Start the GUI client (on any machine; set `CHAT_SOCKET_HOST`/`CHAT_SOCKET_PORT` if using ngrok):
 
 ```powershell
-python secure_chat.py
+.venv\Scripts\python.exe secure_chat.py
+```
+
+If you type `python secure_chat.py` and see a NumPy/PySide error, that means PowerShell is using the system Python instead of the project virtual environment. Run this first:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
 Alternatively use the included Windows launcher:
