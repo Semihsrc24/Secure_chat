@@ -28,6 +28,21 @@ server_stats = {
 running = True
 ENDPOINT_FILE = "socket_endpoint.json"
 
+# Security: Brute-force and spam detection
+failed_logins = {}  # {username: count}
+failed_logins_lock = threading.Lock()
+last_failed_login_time = {}  # {username: timestamp} for 24h reset
+repeat_count = {}  # {username: count}
+last_message = {}  # {username: last_msg_text}
+block_list = {}  # {username: {"blocked_until": timestamp, "block_level": 1}}
+block_list_lock = threading.Lock()
+
+FAILED_LOGIN_THRESHOLD = 3
+FAILED_LOGIN_BLOCK_SECONDS = 60
+REPEAT_MESSAGE_THRESHOLD = 10
+INITIAL_BLOCK_SECONDS = 30
+BLOCK_RESET_HOURS = 24
+
 
 def write_socket_endpoint(host, port, source="unknown"):
     payload = {
@@ -68,6 +83,75 @@ def online_users_text():
     if not names:
         return "(kimse yok)"
     return ", ".join(sorted(names))
+
+
+def check_and_update_block_list(username):
+    """Check if user is currently blocked. If 24h passed, reset block level."""
+    now_ts = time.time()
+    with block_list_lock:
+        if username in block_list:
+            entry = block_list[username]
+            if now_ts < entry["blocked_until"]:
+                return True, entry["blocked_until"] - now_ts  # Still blocked
+            else:
+                # 24h passed, reset block level for next violation
+                del block_list[username]
+    return False, 0
+
+
+def add_to_block_list(username, block_level=1):
+    """Add user to block list with exponential backoff. block_level: 1, 2, 3... corresponds to 30s, 60s, 120s..."""
+    block_duration = INITIAL_BLOCK_SECONDS * (2 ** (block_level - 1))
+    now_ts = time.time()
+    with block_list_lock:
+        block_list[username] = {
+            "blocked_until": now_ts + block_duration,
+            "block_level": block_level,
+            "reason": "spam/brute-force",
+        }
+    return block_duration
+
+
+def check_brute_force_login(username):
+    """Check and track failed login attempts. Return True if user should be blocked."""
+    now_ts = time.time()
+    with failed_logins_lock:
+        # Reset failed login counter if 24h has passed
+        if username in last_failed_login_time:
+            if now_ts - last_failed_login_time[username] > BLOCK_RESET_HOURS * 3600:
+                failed_logins[username] = 0
+                last_failed_login_time[username] = now_ts
+        
+        failed_logins[username] = failed_logins.get(username, 0) + 1
+        last_failed_login_time[username] = now_ts
+        
+        if failed_logins[username] >= FAILED_LOGIN_THRESHOLD:
+            add_to_block_list(username, block_level=1)
+            return True
+    return False
+
+
+def check_repeated_message(username, current_msg):
+    """Check for repeated message spam. Return True if spam detected."""
+    if not current_msg or not current_msg.strip():
+        return False
+    
+    if last_message.get(username) == current_msg:
+        repeat_count[username] = repeat_count.get(username, 0) + 1
+    else:
+        repeat_count[username] = 1
+        last_message[username] = current_msg
+    
+    if repeat_count[username] >= REPEAT_MESSAGE_THRESHOLD:
+        # Determine block level based on current block entry (exponential)
+        current_block_level = 1
+        with block_list_lock:
+            if username in block_list:
+                current_block_level = block_list[username].get("block_level", 1) + 1
+        add_to_block_list(username, block_level=current_block_level)
+        repeat_count[username] = 0  # Reset after block
+        return True
+    return False
 
 
 def remove_client(sock):
@@ -285,6 +369,33 @@ def handle_client(client_sock, addr):
             if now_ts < client_info["blocked_until"]:
                 remain = int(client_info["blocked_until"] - now_ts)
                 send_packet(client_sock, {"type": "system", "text": f"Gecici engellendiniz. Kalan sure: {remain}s"})
+                continue
+
+            # Check if user is blocked by security system
+            is_blocked, remaining = check_and_update_block_list(username)
+            if is_blocked:
+                remain = int(remaining)
+                alert_msg = {
+                    "type": "alert",
+                    "text": f"[SPAM/FLOOD] Engellendiz. Kalan sure: {remain}s",
+                }
+                send_packet(client_sock, alert_msg)
+                broadcast(alert_msg)
+                logging.warning("BLOCKED user=%s ip=%s port=%s", username, addr[0], addr[1])
+                continue
+
+            # Check for repeated message spam
+            if check_repeated_message(username, text):
+                client_info["alerts"] += 1
+                with clients_lock:
+                    server_stats["total_alerts"] += 1
+                alert_msg = {
+                    "type": "alert",
+                    "text": f"[SPAM] {username} çok hızlı tekrar mesaj gönderiyor. Engellendi.",
+                }
+                send_packet(client_sock, alert_msg)
+                broadcast(alert_msg)
+                logging.warning("SPAM_DETECTED user=%s ip=%s port=%s", username, addr[0], addr[1])
                 continue
 
             reason = detect_intrusion(client_info, text, now_ts)

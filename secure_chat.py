@@ -553,6 +553,21 @@ class ChatWindow(QWidget):
         self.chat_header.setStyleSheet("background-color: #075E54; color: white;")
         right_panel.addWidget(self.chat_header)
 
+        # Alert frame (kırmızı kutu) - initially hidden
+        self.alert_frame = QFrame()
+        alert_layout = QVBoxLayout()
+        alert_layout.setContentsMargins(12, 10, 12, 10)
+        self.alert_label = QLabel("")
+        self.alert_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.alert_label.setStyleSheet("color: black;")
+        self.alert_label.setWordWrap(True)
+        alert_layout.addWidget(self.alert_label)
+        self.alert_frame.setLayout(alert_layout)
+        self.alert_frame.setStyleSheet("background-color: #ff4444; border-radius: 8px; padding: 10px;")
+        self.alert_frame.setVisible(False)
+        self.alert_frame.setMaximumHeight(80)
+        right_panel.addWidget(self.alert_frame)
+
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setStyleSheet("""
@@ -670,6 +685,13 @@ class ChatWindow(QWidget):
         self.current_user_tag = data.get("tag") or self.current_user_tag
         self.user_tag_label.setText(f"Your tag: {self.current_user_tag}")
 
+    def show_alert(self, message: str, duration_ms: int = 5000):
+        """Show alert with red background, auto-dismiss after duration_ms."""
+        self.alert_label.setText(message)
+        self.alert_frame.setVisible(True)
+        # Auto-hide after duration
+        QTimer.singleShot(duration_ms, self.alert_frame.hide)
+
     def connect_socket(self):
         if not self.current_user_uid:
             return
@@ -705,6 +727,13 @@ class ChatWindow(QWidget):
                     error = packet.get("error")
                     if error:
                         print(f"Socket disconnected: {error}")
+                continue
+
+            # Handle alert packets
+            if packet_type == "alert":
+                alert_text = packet.get("text", "Alert!")
+                self.show_alert(alert_text, duration_ms=5000)
+                print(f"[ALERT] {alert_text}")
                 continue
 
             if packet_type != "message":
