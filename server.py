@@ -34,12 +34,13 @@ failed_logins_lock = threading.Lock()
 last_failed_login_time = {}  # {username: timestamp} for 24h reset
 repeat_count = {}  # {username: count}
 last_message = {}  # {username: last_msg_text}
+repeat_count_lock = threading.Lock()  # Thread-safe access to repeat_count/last_message
 block_list = {}  # {username: {"blocked_until": timestamp, "block_level": 1}}
 block_list_lock = threading.Lock()
 
 FAILED_LOGIN_THRESHOLD = 3
 FAILED_LOGIN_BLOCK_SECONDS = 60
-REPEAT_MESSAGE_THRESHOLD = 10
+REPEAT_MESSAGE_THRESHOLD = 5  # Changed from 10 to 5 for faster spam detection
 INITIAL_BLOCK_SECONDS = 30
 BLOCK_RESET_HOURS = 24
 
@@ -132,24 +133,28 @@ def check_brute_force_login(username):
 
 
 def check_repeated_message(username, current_msg):
-    """Check for repeated message spam. Return True if spam detected."""
+    """Check for repeated message spam. Return True if spam detected. Thread-safe."""
     if not current_msg or not current_msg.strip():
         return False
     
-    if last_message.get(username) == current_msg:
-        repeat_count[username] = repeat_count.get(username, 0) + 1
-    else:
-        repeat_count[username] = 1
-        last_message[username] = current_msg
+    with repeat_count_lock:
+        if last_message.get(username) == current_msg:
+            repeat_count[username] = repeat_count.get(username, 0) + 1
+        else:
+            repeat_count[username] = 1
+            last_message[username] = current_msg
+        
+        current_repeat = repeat_count[username]
     
-    if repeat_count[username] >= REPEAT_MESSAGE_THRESHOLD:
+    if current_repeat >= REPEAT_MESSAGE_THRESHOLD:
         # Determine block level based on current block entry (exponential)
         current_block_level = 1
         with block_list_lock:
             if username in block_list:
                 current_block_level = block_list[username].get("block_level", 1) + 1
         add_to_block_list(username, block_level=current_block_level)
-        repeat_count[username] = 0  # Reset after block
+        with repeat_count_lock:
+            repeat_count[username] = 0  # Reset after block
         return True
     return False
 
@@ -382,20 +387,33 @@ def handle_client(client_sock, addr):
                 send_packet(client_sock, alert_msg)
                 broadcast(alert_msg)
                 logging.warning("BLOCKED user=%s ip=%s port=%s", username, addr[0], addr[1])
+                print(f"[BLOCKED] {username}: {remain}s remaining")
                 continue
 
             # Check for repeated message spam
+            print(f"[SPAM_CHECK] user={username} msg='{text[:30]}'")
             if check_repeated_message(username, text):
                 client_info["alerts"] += 1
                 with clients_lock:
                     server_stats["total_alerts"] += 1
+                
+                # Also update client_info blocked_until for consistency
+                current_block_level = 1
+                with block_list_lock:
+                    if username in block_list:
+                        current_block_level = block_list[username].get("block_level", 1)
+                block_duration = INITIAL_BLOCK_SECONDS * (2 ** (current_block_level - 1))
+                now_ts = time.time()
+                client_info["blocked_until"] = now_ts + block_duration
+                
                 alert_msg = {
                     "type": "alert",
-                    "text": f"[SPAM] {username} çok hızlı tekrar mesaj gönderiyor. Engellendi.",
+                    "text": f"[SPAM] {username} çok hızlı tekrar mesaj gönderiyor. {int(block_duration)}s engellendi.",
                 }
                 send_packet(client_sock, alert_msg)
                 broadcast(alert_msg)
-                logging.warning("SPAM_DETECTED user=%s ip=%s port=%s", username, addr[0], addr[1])
+                logging.warning("SPAM_DETECTED user=%s ip=%s port=%s duration=%ds", username, addr[0], addr[1], int(block_duration))
+                print(f"[SPAM_DETECTED] {username}: blocked for {int(block_duration)}s")
                 continue
 
             reason = detect_intrusion(client_info, text, now_ts)
