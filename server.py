@@ -98,6 +98,47 @@ def send_packet(sock, payload):
         remove_client(sock)
 
 
+def store_public_key(uid: str, public_key_pem: str):
+    """Store user's public key in a simple JSON file for E2E key exchange."""
+    try:
+        keys_file = "public_keys.json"
+        keys_data = {}
+        
+        if os.path.exists(keys_file):
+            try:
+                with open(keys_file, "r", encoding="utf-8") as f:
+                    keys_data = json.load(f)
+            except Exception:
+                keys_data = {}
+        
+        keys_data[uid] = public_key_pem
+        
+        with open(keys_file, "w", encoding="utf-8") as f:
+            json.dump(keys_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"[E2E] Public key stored for user {uid}")
+        return True
+    except Exception as e:
+        print(f"[E2E] Failed to store public key for {uid}: {e}")
+        return False
+
+
+def get_public_key(uid: str) -> str:
+    """Retrieve user's public key for E2E encryption."""
+    try:
+        keys_file = "public_keys.json"
+        if not os.path.exists(keys_file):
+            return ""
+        
+        with open(keys_file, "r", encoding="utf-8") as f:
+            keys_data = json.load(f)
+        
+        return keys_data.get(uid, "")
+    except Exception as e:
+        print(f"[E2E] Failed to retrieve public key for {uid}: {e}")
+        return ""
+
+
 def broadcast(payload, exclude_sock=None):
     with clients_lock:
         sockets = list(clients.keys())
@@ -367,6 +408,20 @@ def handle_client(client_sock, addr):
             packet_type = packet.get("type")
             is_command_packet = packet_type in {"command", "text", "nickname"}
 
+            # Handle E2E public key exchange
+            if packet_type == "key_exchange":
+                user_id = str(packet.get("user_id", "")).strip()
+                public_key = str(packet.get("public_key", "")).strip()
+                
+                if user_id and public_key:
+                    store_public_key(user_id, public_key)
+                    send_packet(client_sock, {
+                        "type": "system",
+                        "text": "[E2E] Public key registered successfully"
+                    })
+                    logging.info("E2E_KEY_EXCHANGE user_id=%s", user_id)
+                continue
+
             if packet_type in {"message", "command", "text"}:
                 text = str(packet.get("text", text)).strip()
 
@@ -607,6 +662,7 @@ def handle_admin_client(admin_sock, addr):
                     # Return current server statistics
                     with clients_lock:
                         client_count = len(clients)
+                        client_names = [info.get("name", "-") for info in clients.values()]
                         total_msgs = server_stats["total_messages"]
                         total_alerts = server_stats["total_alerts"]
                     
@@ -616,6 +672,7 @@ def handle_admin_client(admin_sock, addr):
                     stats = {
                         "type": "STATS_UPDATE",
                         "client_count": client_count,
+                        "client_names": client_names,
                         "total_messages": total_msgs,
                         "total_alerts": total_alerts,
                         "avg_rtt": avg_rtt,

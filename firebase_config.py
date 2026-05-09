@@ -41,7 +41,7 @@ def _load_dotenv_file() -> None:
             if key and key not in os.environ:
                 os.environ[key] = value
     except Exception as exc:
-        print(f"⚠️  .env load error: {exc}")
+        print(f"[WARNING] .env load error: {exc}")
 
 
 _load_dotenv_file()
@@ -69,14 +69,14 @@ class FirebaseManager:
         try:
             # Check if firebase_admin is available
             if not _HAS_FIREBASE:
-                print("⚠️  firebase_admin not installed → Demo mode enabled")
+                print("[WARNING] firebase_admin not installed - Demo mode enabled")
                 self._demo_mode = True
                 self._initialized = True
                 return
 
             # Firebase Admin SDK başlat
             if not os.path.exists(CREDENTIALS_PATH):
-                print(f"⚠️  {CREDENTIALS_PATH} not found!")
+                print(f"[WARNING] {CREDENTIALS_PATH} not found!")
                 print("Demo mode enabled - real Firebase connection will not be used")
                 self._demo_mode = True
                 self._initialized = True
@@ -91,9 +91,9 @@ class FirebaseManager:
             )
             self._demo_mode = False
             self._initialized = True
-            print("✓ Firebase connected")
+            print("[OK] Firebase connected")
         except Exception as e:
-            print(f"⚠️  Firebase error, demo mode enabled: {e}")
+            print(f"[WARNING] Firebase error, demo mode enabled: {e}")
             self._demo_mode = True
             self._initialized = True
 
@@ -328,6 +328,22 @@ class FirebaseManager:
             ref.update({"status": status, "last_seen": datetime.now().isoformat()})
         except Exception as e:
             print(f"Status update error: {e}")
+
+    @staticmethod
+    def update_user_profile(uid: str, updates: dict):
+        """Update user profile with given fields (e.g., public_key)"""
+        try:
+            if FirebaseManager()._demo_mode:
+                if hasattr(FirebaseManager, '_demo_users') and uid in FirebaseManager._demo_users:
+                    FirebaseManager._demo_users[uid].update(updates)
+                return True
+            
+            ref = db.reference(f"users/{uid}")
+            ref.update(updates)
+            return True
+        except Exception as e:
+            print(f"Profile update error: {e}")
+            return False
 
     @staticmethod
     def get_all_users(current_uid: str) -> dict:

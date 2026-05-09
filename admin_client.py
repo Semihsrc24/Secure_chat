@@ -57,6 +57,11 @@ def main():
                 if response:
                     data = json.loads(response)
                     print(f"  Clients: {data.get('client_count', 0)}")
+                    names = data.get('client_names', []) or []
+                    if names:
+                        print(f"  Connected users: {', '.join(names)}")
+                    else:
+                        print("  Connected users: (none)")
                     print(f"  Total messages: {data.get('total_messages', 0)}")
                     print(f"  Total alerts: {data.get('total_alerts', 0)}")
                     print(f"  Average RTT: {data.get('avg_rtt', 0):.2f} ms")

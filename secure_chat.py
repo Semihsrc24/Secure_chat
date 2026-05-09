@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
 from PySide6.QtGui import QFont, QIcon, QPixmap, QColor, QTextCursor, QTextBlockFormat
 from firebase_config import firebase
+from e2e_encryption import E2EEncryption
 # Fernet key handling: either from env `FERNET_KEY`, from `fernet.key`,
 # or generated once and written to `fernet.key` for convenience.
 
@@ -141,7 +142,7 @@ class SocketChatClient:
         self.thread = None
         self._sock_lock = threading.Lock()
 
-    def connect(self, uid: str, username: str, token: str = "") -> bool:
+    def connect(self, uid: str, username: str, token: str = "", public_key_pem: str = "") -> bool:
         self.disconnect(close_only=True)
 
         try:
@@ -158,6 +159,15 @@ class SocketChatClient:
                 "name": username,
                 "token": token,
             })
+            
+            # Send E2E public key to server for key exchange
+            if public_key_pem:
+                self._send_packet({
+                    "type": "key_exchange",
+                    "user_id": uid,
+                    "public_key": public_key_pem,
+                })
+            
             self.thread = threading.Thread(target=self._receive_loop, daemon=True)
             self.thread.start()
             self.event_queue.put({"type": "connection", "connected": True})
@@ -465,6 +475,8 @@ class ChatWindow(QWidget):
         self.current_user_token = ""
         self.message_queue = queue.Queue()
         self.socket_client = SocketChatClient(SOCKET_HOST, SOCKET_PORT, self.message_queue)
+        # E2E encryption manager
+        self.e2e = None
         # signals for background thread results
         self.signals = MessageSignals()
         self.signals.chat_updated.connect(self._apply_contacts)
@@ -702,9 +714,9 @@ class ChatWindow(QWidget):
             remain = max(1, int(self.chat_blocked_until - now_ts))
             self._set_message_controls_enabled(False)
             if self.chat_block_reason == "spam":
-                self.message_input.setPlaceholderText(f"Spam nedeniyle engellendi ({remain}s)")
+                self.message_input.setPlaceholderText(f"Blocked due to spam ({remain}s)")
             else:
-                self.message_input.setPlaceholderText(f"Mesaj gönderme engellendi ({remain}s)")
+                self.message_input.setPlaceholderText(f"Message sending blocked ({remain}s)")
         else:
             self.chat_blocked_until = 0.0
             self.chat_block_reason = ""
@@ -734,19 +746,27 @@ class ChatWindow(QWidget):
         if self._local_spam_repeat_count >= LOCAL_SPAM_THRESHOLD:
             self.chat_blocked_until = time.time() + 30
             self.chat_block_reason = "spam"
-            self.show_alert("[SPAM] Çok hızlı tekrar mesaj gönderiyorsun. 30s engellendi.", duration_ms=5000)
+            self.show_alert("[SPAM] You are sending messages too quickly. Blocked for 30s.", duration_ms=5000)
             self._sync_message_block_state()
             return True
 
         return False
 
     def load_user_data(self, uid, email, token=""):
-        """Load user data"""
+        """Load user data and initialize E2E encryption"""
         self.current_user_uid = uid
         self.current_user_token = token or ""
         fallback_name = email.split("@")[0]
         self.current_user_name = fallback_name
         self.current_user_tag = fallback_name
+        
+        # Initialize E2E encryption for this user
+        try:
+            self.e2e = E2EEncryption(uid)
+            print(f"[E2E] Encryption initialized for user {uid}")
+        except Exception as e:
+            print(f"[E2E] Failed to initialize encryption: {e}")
+            self.e2e = None
 
         def _fetch_profile(user_uid, default_name):
             try:
@@ -754,6 +774,15 @@ class ChatWindow(QWidget):
                 name = profile.get("username", default_name)
                 tag = profile.get("tag") or name
                 self.signals.profile_loaded.emit({"uid": user_uid, "name": name, "tag": tag})
+                
+                # Upload public key to Firebase if E2E is initialized
+                if self.e2e:
+                    try:
+                        public_key_pem = self.e2e.get_public_key_pem()
+                        firebase.update_user_profile(user_uid, {"public_key": public_key_pem})
+                        print(f"[E2E] Public key uploaded for user {user_uid}")
+                    except Exception as e:
+                        print(f"[E2E] Failed to upload public key: {e}")
             except Exception as e:
                 print(f"Profile load error: {e}")
 
@@ -777,6 +806,57 @@ class ChatWindow(QWidget):
         self.current_user_tag = data.get("tag") or self.current_user_tag
         self.user_tag_label.setText(f"Your tag: {self.current_user_tag}")
 
+    def _fetch_recipient_public_key(self, recipient_uid: str) -> str:
+        """Fetch recipient's public key from Firebase."""
+        try:
+            # Try to get from Firebase public_key field
+            profile = firebase.get_user_profile(recipient_uid)
+            public_key_pem = profile.get("public_key", "")
+            if public_key_pem and self.e2e:
+                self.e2e.cache_public_key(recipient_uid, public_key_pem)
+            return public_key_pem
+        except Exception as e:
+            print(f"[E2E] Failed to fetch public key for {recipient_uid}: {e}")
+            return ""
+
+    def _encrypt_message_e2e(self, message: str, recipient_uid: str) -> str:
+        """Encrypt message using E2E encryption for recipient."""
+        if not self.e2e:
+            # Fallback to Fernet if E2E not available
+            return _encrypt_text_if_needed(message)
+        
+        # Check if we have recipient's public key cached
+        recipient_public_key = self.e2e.get_cached_public_key(recipient_uid)
+        
+        if not recipient_public_key:
+            # Fetch from Firebase
+            public_key_pem = self._fetch_recipient_public_key(recipient_uid)
+            if not public_key_pem:
+                print(f"[E2E] No public key for {recipient_uid}, using Fernet fallback")
+                return _encrypt_text_if_needed(message)
+            recipient_public_key = self.e2e.get_cached_public_key(recipient_uid)
+        
+        if not recipient_public_key:
+            print(f"[E2E] Could not load public key for {recipient_uid}")
+            return _encrypt_text_if_needed(message)
+        
+        # Encrypt with recipient's public key
+        encrypted = self.e2e.encrypt_message(message, recipient_public_key)
+        return encrypted
+
+    def _decrypt_message_e2e(self, encrypted_message: str) -> str:
+        """Decrypt message using E2E encryption."""
+        if not self.e2e:
+            # Fallback to Fernet
+            return _maybe_decrypt_text(encrypted_message)
+        
+        # If it's an E2E encrypted message
+        if isinstance(encrypted_message, str) and encrypted_message.startswith("e2e:v1:"):
+            return self.e2e.decrypt_message(encrypted_message)
+        
+        # Otherwise try Fernet
+        return _maybe_decrypt_text(encrypted_message)
+
     def show_alert(self, message: str, duration_ms: int = 5000):
         """Show alert with red background, auto-dismiss after duration_ms."""
         self.alert_label.setText(message)
@@ -794,9 +874,11 @@ class ChatWindow(QWidget):
         uid = self.current_user_uid
         name = self.current_user_name or self.current_user_tag or self.current_user_uid
         token = self.current_user_token
+        # Get public key for E2E key exchange
+        public_key_pem = self.e2e.get_public_key_pem() if self.e2e else ""
 
         def _connect():
-            connected = self.socket_client.connect(uid, name, token)
+            connected = self.socket_client.connect(uid, name, token, public_key_pem)
             if not connected:
                 print(f"Socket connection failed: {SOCKET_HOST}:{SOCKET_PORT}")
 
@@ -898,9 +980,9 @@ class ChatWindow(QWidget):
 
             if not friend_ids:
                 # no friends yet; show a placeholder item that opens Add Friend on click
-                placeholder = QListWidgetItem("Arkadaş ekle")
+                placeholder = QListWidgetItem("Add Friend")
                 placeholder.setData(Qt.UserRole, None)
-                placeholder.setToolTip("Henüz arkadaşınız yok. Arkadaş eklemek için tıklayın.")
+                placeholder.setToolTip("No friends yet. Click to add a friend.")
                 placeholder.setForeground(QColor("#777777"))
                 f = placeholder.font()
                 f.setItalic(True)
@@ -1146,11 +1228,18 @@ class ChatWindow(QWidget):
                 except:
                     time_str = ""
 
-                # Attempt to decrypt if message is encrypted
-                try:
+                # Messages from Firebase are plaintext now
+                # Only E2E encrypted messages (from socket) need decryption
+                display_text = text  # Default: plaintext from Firebase
+                
+                # If message starts with E2E prefix, try to decrypt
+                if text.startswith("e2e:v1:"):
+                    decrypted = self._decrypt_message_e2e(text)
+                    if not decrypted.startswith("[E2E message"):
+                        display_text = decrypted
+                elif text.startswith("enc:v1:"):
+                    # Legacy Fernet encryption
                     display_text = _maybe_decrypt_text(text)
-                except Exception:
-                    display_text = text
                 safe_text = html.escape(display_text).replace("\n", "<br>")
                 safe_other_username = html.escape(other_username)
 
@@ -1198,9 +1287,9 @@ class ChatWindow(QWidget):
         if now_ts < self.chat_blocked_until:
             remain = int(self.chat_blocked_until - now_ts)
             if self.chat_block_reason == "spam":
-                QMessageBox.warning(self, "Blocked", f"Spam nedeniyle mesaj gönderemezsiniz. Kalan süre: {remain}s")
+                QMessageBox.warning(self, "Blocked", f"Due to spam you are blocked for: {remain}s")
             else:
-                QMessageBox.warning(self, "Blocked", f"Mesaj gönderemezsiniz. Kalan süre: {remain}s")
+                QMessageBox.warning(self, "Blocked", f"Message sending blocked. Remaining time: {remain}s")
             return
 
         message = self.message_input.text().strip()
@@ -1210,8 +1299,12 @@ class ChatWindow(QWidget):
         try:
             # compute fingerprint from plaintext so server can detect repeats
             fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()
-            to_send = _encrypt_text_if_needed(message)
-            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, to_send)
+            # Use E2E encryption if available, otherwise fallback to Fernet
+            to_send = self._encrypt_message_e2e(message, self.current_chat_uid)
+            
+            # For display, send plaintext version to Firebase (we're the sender)
+            # E2E encryption is for transit only (socket), not storage
+            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, message)
 
             if success:
                 # include fingerprint in real-time socket packet for spam detection
@@ -1219,7 +1312,7 @@ class ChatWindow(QWidget):
                     self.current_user_uid,
                     self.current_user_name or self.current_user_tag or self.current_user_uid,
                     self.current_chat_uid,
-                    to_send,
+                    to_send,  # Send encrypted version via socket
                     fingerprint=fingerprint,
                 )
                 self._register_local_spam_signal(fingerprint)
