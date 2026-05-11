@@ -207,6 +207,7 @@ class LoginWindow(QWidget):
         self.failed_login_counts = {}  # email -> count
         self.login_blocked_untils = {}  # email -> timestamp
         self.failed_login_reset_time = {}  # email -> timestamp (optional)
+        self.login_security_alert_pending = {}  # email -> bool
         self.login_result.connect(self._on_login_result)
         self.init_ui()
         
@@ -344,12 +345,22 @@ class LoginWindow(QWidget):
 
         if result.get("success"):
             email = result.get("email") or self.login_email.text().strip()
+            should_show_security_alert = bool(self.login_security_alert_pending.get(email, False))
             # Reset failed login tracking on success for this account
             try:
                 self.failed_login_counts[email] = 0
                 self.login_blocked_untils[email] = 0.0
+                self.login_security_alert_pending[email] = False
             except Exception:
                 pass
+
+            if should_show_security_alert:
+                QMessageBox.warning(
+                    self,
+                    "Security Alert",
+                    "There were multiple failed login attempts on your account. For your security, please change your password.",
+                )
+
             self.parent_window.login(result.get("uid", ""), email, result.get("token", ""))
             return
 
@@ -361,6 +372,7 @@ class LoginWindow(QWidget):
             if count >= 5:
                 self.login_blocked_untils[email] = time.time() + 300  # 5 minutes
                 self.failed_login_counts[email] = 0
+                self.login_security_alert_pending[email] = True
                 QMessageBox.warning(self, "Blocked", "Too many incorrect attempts for this account. Login blocked for 5 minutes.")
                 return
         except Exception:
