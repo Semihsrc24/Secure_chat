@@ -3,6 +3,7 @@
 import sys
 import os
 import json
+import base64
 import socket
 import queue
 import threading
@@ -22,73 +23,6 @@ from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
 from PySide6.QtGui import QFont, QIcon, QPixmap, QColor, QTextCursor, QTextBlockFormat
 from firebase_config import firebase
 from e2e_encryption import E2EEncryption
-# Fernet key handling: either from env `FERNET_KEY`, from `fernet.key`,
-# or generated once and written to `fernet.key` for convenience.
-
-FERNET = None
-try:
-    from cryptography.fernet import Fernet
-    _fkey = os.getenv("FERNET_KEY", "").strip()
-    if not _fkey:
-        if os.path.exists("fernet.key"):
-            try:
-                with open("fernet.key", "r", encoding="utf-8") as fk:
-                    _fkey = fk.read().strip()
-            except Exception:
-                _fkey = ""
-
-    # If no key provided or found, generate one and persist to fernet.key (ONLY if file doesn't exist)
-    if not _fkey:
-        if not os.path.exists("fernet.key"):
-            try:
-                _fkey = Fernet.generate_key().decode()
-                try:
-                    with open("fernet.key", "w", encoding="utf-8") as fk:
-                        fk.write(_fkey)
-                    print("[SEC] Yeni fernet.key oluşturuldu ve kaydedildi")
-                except Exception as e:
-                    print(f"[SEC] fernet.key kaydedilemedi: {e}")
-            except Exception as e:
-                print(f"[SEC] Fernet anahtari olusturulamadi: {e}")
-                _fkey = ""
-
-    if _fkey:
-        try:
-            FERNET = Fernet(_fkey.encode() if isinstance(_fkey, str) else _fkey)
-            print("[SEC] Fernet aktif")
-        except Exception as e:
-            print(f"[SEC] Fernet anahtari ile baslatilamadi: {e}")
-    else:
-        print("[SEC] Fernet anahtari bulunamadi; sifreleme devre disi.")
-except Exception:
-    print("[SEC] cryptography kütüphanesi yok veya import edilemedi; Fernet devre disi.")
-
-
-def _encrypt_text_if_needed(text: str) -> str:
-    if not FERNET or not isinstance(text, str) or not text:
-        return text
-    try:
-        token = FERNET.encrypt(text.encode("utf-8"))
-        return f"enc:v1:{token.decode('utf-8')}"
-    except Exception:
-        return text
-
-
-def _maybe_decrypt_text(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    if not text.startswith("enc:v1:"):
-        return text
-    if not FERNET:
-        return "[Encrypted message - no key available]"
-    try:
-        token = text.split(":", 2)[2]
-        plain = FERNET.decrypt(token.encode("utf-8"))
-        return plain.decode("utf-8")
-    except Exception:
-        # Decryption failed (likely wrong/missing key or corrupted token).
-        # Show a clearer message so user can troubleshoot key sync.
-        return "[Encrypted message could not be decrypted]"
 
 
 def _normalize_host(raw_host: str) -> str:
@@ -822,8 +756,7 @@ class ChatWindow(QWidget):
     def _encrypt_message_e2e(self, message: str, recipient_uid: str) -> str:
         """Encrypt message using E2E encryption for recipient."""
         if not self.e2e:
-            # Fallback to Fernet if E2E not available
-            return _encrypt_text_if_needed(message)
+            return message
         
         # Check if we have recipient's public key cached
         recipient_public_key = self.e2e.get_cached_public_key(recipient_uid)
@@ -832,13 +765,13 @@ class ChatWindow(QWidget):
             # Fetch from Firebase
             public_key_pem = self._fetch_recipient_public_key(recipient_uid)
             if not public_key_pem:
-                print(f"[E2E] No public key for {recipient_uid}, using Fernet fallback")
-                return _encrypt_text_if_needed(message)
+                print(f"[E2E] No public key for {recipient_uid}")
+                return message
             recipient_public_key = self.e2e.get_cached_public_key(recipient_uid)
         
         if not recipient_public_key:
             print(f"[E2E] Could not load public key for {recipient_uid}")
-            return _encrypt_text_if_needed(message)
+            return message
         
         # Encrypt with recipient's public key
         encrypted = self.e2e.encrypt_message(message, recipient_public_key)
@@ -847,15 +780,65 @@ class ChatWindow(QWidget):
     def _decrypt_message_e2e(self, encrypted_message: str) -> str:
         """Decrypt message using E2E encryption."""
         if not self.e2e:
-            # Fallback to Fernet
-            return _maybe_decrypt_text(encrypted_message)
+            return encrypted_message
         
         # If it's an E2E encrypted message
         if isinstance(encrypted_message, str) and encrypted_message.startswith("e2e:v1:"):
             return self.e2e.decrypt_message(encrypted_message)
         
-        # Otherwise try Fernet
-        return _maybe_decrypt_text(encrypted_message)
+        return encrypted_message
+
+    def _build_encrypted_storage_text(self, plain_text: str, recipient_uid: str) -> str:
+        """Create a Firebase-safe encrypted payload for both sender and receiver."""
+        recipient_cipher = self._encrypt_message_e2e(plain_text, recipient_uid)
+
+        sender_cipher = ""
+        if self.e2e and getattr(self.e2e, "public_key", None):
+            sender_cipher = self.e2e.encrypt_message(plain_text, self.e2e.public_key)
+
+        # Never store plaintext in Firebase for new messages.
+        if recipient_cipher == plain_text or sender_cipher == plain_text:
+            return ""
+
+        payload = {
+            "v": "dbenc-v1",
+            "sender_uid": self.current_user_uid,
+            "receiver_uid": recipient_uid,
+            "for_sender": sender_cipher,
+            "for_receiver": recipient_cipher,
+        }
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return "dbenc:v1:" + base64.b64encode(raw).decode("ascii")
+
+    def _decrypt_stored_text(self, text: str, sender_uid: str, receiver_uid: str) -> str:
+        """Decrypt Firebase-stored text (supports new dbenc payload + legacy formats)."""
+        if not isinstance(text, str):
+            return str(text)
+
+        if text.startswith("dbenc:v1:"):
+            try:
+                raw = base64.b64decode(text.split(":", 2)[2].encode("ascii"))
+                payload = json.loads(raw.decode("utf-8"))
+                me = (self.current_user_uid or "").strip()
+
+                if me and me == (payload.get("sender_uid") or sender_uid or "").strip():
+                    chosen = payload.get("for_sender", "")
+                elif me and me == (payload.get("receiver_uid") or receiver_uid or "").strip():
+                    chosen = payload.get("for_receiver", "")
+                else:
+                    chosen = payload.get("for_receiver", "") or payload.get("for_sender", "")
+
+                if not chosen:
+                    return "[Encrypted message unavailable]"
+                return self._decrypt_message_e2e(chosen)
+            except Exception:
+                return "[Encrypted message could not be decoded]"
+
+        if text.startswith("e2e:v1:"):
+            return self._decrypt_message_e2e(text)
+
+        # Legacy plaintext messages may still exist in older history.
+        return text
 
     def show_alert(self, message: str, duration_ms: int = 5000):
         """Show alert with red background, auto-dismiss after duration_ms."""
@@ -1218,6 +1201,7 @@ class ChatWindow(QWidget):
 
             for msg in unique_messages:
                 sender_uid = (msg.get("sender") or "").strip()
+                receiver_uid = (msg.get("receiver") or "").strip()
                 text = msg.get("text", "")
                 timestamp = msg.get("timestamp", "")
                 current_uid = (str(self.current_user_uid) or "").strip()
@@ -1228,18 +1212,7 @@ class ChatWindow(QWidget):
                 except:
                     time_str = ""
 
-                # Messages from Firebase are plaintext now
-                # Only E2E encrypted messages (from socket) need decryption
-                display_text = text  # Default: plaintext from Firebase
-                
-                # If message starts with E2E prefix, try to decrypt
-                if text.startswith("e2e:v1:"):
-                    decrypted = self._decrypt_message_e2e(text)
-                    if not decrypted.startswith("[E2E message"):
-                        display_text = decrypted
-                elif text.startswith("enc:v1:"):
-                    # Legacy Fernet encryption
-                    display_text = _maybe_decrypt_text(text)
+                display_text = self._decrypt_stored_text(text, sender_uid, receiver_uid)
                 safe_text = html.escape(display_text).replace("\n", "<br>")
                 safe_other_username = html.escape(other_username)
 
@@ -1299,12 +1272,16 @@ class ChatWindow(QWidget):
         try:
             # compute fingerprint from plaintext so server can detect repeats
             fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()
-            # Use E2E encryption if available, otherwise fallback to Fernet
+            # Use E2E encryption (message send is blocked if keys are not ready)
             to_send = self._encrypt_message_e2e(message, self.current_chat_uid)
-            
-            # For display, send plaintext version to Firebase (we're the sender)
-            # E2E encryption is for transit only (socket), not storage
-            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, message)
+
+            # Store fully encrypted payload in Firebase (sender+receiver specific ciphers)
+            encrypted_storage_text = self._build_encrypted_storage_text(message, self.current_chat_uid)
+            if not encrypted_storage_text:
+                QMessageBox.warning(self, "Error", "Encryption keys are not ready yet. Please retry.")
+                return
+
+            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, encrypted_storage_text)
 
             if success:
                 # include fingerprint in real-time socket packet for spam detection

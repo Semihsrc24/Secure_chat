@@ -629,6 +629,12 @@ class FirebaseManager:
     def get_recent_chats(uid: str) -> dict:
         """Get recent chats for a user"""
         try:
+            def _preview_text(raw_text):
+                text = raw_text if isinstance(raw_text, str) else str(raw_text or "")
+                if text.startswith("dbenc:v1:") or text.startswith("e2e:v1:"):
+                    return "[Encrypted message]"
+                return text
+
             if FirebaseManager()._demo_mode:
                 chats = {}
                 if hasattr(FirebaseManager, '_demo_messages'):
@@ -638,7 +644,7 @@ class FirebaseManager:
                             last_msg = msg_list[0] if msg_list else {}
                             other_uid = chat_id.replace(uid, "").replace("-", "")
                             chats[other_uid] = {
-                                "last_message": last_msg.get("text", ""),
+                                "last_message": _preview_text(last_msg.get("text", "")),
                                 "timestamp": last_msg.get("timestamp", ""),
                                 "unread": sum(1 for m in msg_list if not m.get("read") and m.get("receiver") == uid)
                             }
@@ -663,7 +669,7 @@ class FirebaseManager:
                     other_uid = chat_id.replace(uid, "").replace("-", "")
 
                     chats[other_uid] = {
-                        "last_message": last_msg.get("text", ""),
+                        "last_message": _preview_text(last_msg.get("text", "")),
                         "timestamp": last_msg.get("timestamp", ""),
                         "unread": sum(1 for m in msg_list if not m.get("read") and m.get("receiver") == uid)
                     }
