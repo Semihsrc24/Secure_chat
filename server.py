@@ -85,9 +85,9 @@ def write_socket_endpoint(host, port, source="unknown"):
     try:
         with open(ENDPOINT_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"[CONFIG] Socket endpoint yazildi: {payload['host']}:{payload['port']} ({source})")
+        print(f"[CONFIG] Socket endpoint written: {payload['host']}:{payload['port']} ({source})")
     except Exception as exc:
-        print(f"[CONFIG] Socket endpoint dosyasi yazilamadi: {exc}")
+        print(f"[CONFIG] Failed to write socket endpoint file: {exc}")
 
 
 def send_packet(sock, payload):
@@ -153,7 +153,7 @@ def online_users_text():
     with clients_lock:
         names = [info["name"] for info in clients.values()]
     if not names:
-        return "(kimse yok)"
+        return "(no one online)"
     return ", ".join(sorted(names))
 
 
@@ -256,14 +256,14 @@ def remove_client(sock):
         pass
 
     if username:
-        msg = {"type": "system", "text": f"{username} ayrildi."}
-        print(f"[SERVER] {username} ayrildi.")
+        msg = {"type": "system", "text": f"{username} left."}
+        print(f"[SERVER] {username} left.")
         logging.info("DISCONNECT user=%s", username)
         broadcast(msg)
 
 
 def unique_name(requested_name):
-    name = requested_name.strip() if requested_name.strip() else "Misafir"
+    name = requested_name.strip() if requested_name.strip() else "Guest"
     with clients_lock:
         used = {info["name"] for info in clients.values()}
 
@@ -345,7 +345,7 @@ def monitor_loop():
 
 
 def handle_client(client_sock, addr):
-    # Bu istemci protokolunde ilk paket nickname olarak bekleniyor.
+    # In this client protocol, the first packet is expected as nickname/auth payload.
     reader = client_sock.makefile("r", encoding="utf-8", newline="\n")
     try:
         raw_name = reader.readline()
@@ -359,7 +359,7 @@ def handle_client(client_sock, addr):
         except Exception:
             first_packet = {"type": "nickname", "name": requested_name}
 
-        requested_name = str(first_packet.get("name") or first_packet.get("uid") or "Misafir").strip()
+        requested_name = str(first_packet.get("name") or first_packet.get("uid") or "Guest").strip()
         username = unique_name(requested_name)
         uid = str(first_packet.get("uid") or username).strip()
 
@@ -382,12 +382,12 @@ def handle_client(client_sock, addr):
             server_stats["total_connections"] += 1
 
         welcome = (
-            f"Hos geldin {username}!"
+            f"Welcome {username}!"
         )
         send_packet(client_sock, {"type": "system", "text": welcome, "uid": uid, "name": username})
 
-        join_msg = {"type": "system", "text": f"{username} sohbete katildi.", "uid": uid, "name": username}
-        print(f"{addr[0]}:{addr[1]} -> {username} baglandi")
+        join_msg = {"type": "system", "text": f"{username} joined the chat.", "uid": uid, "name": username}
+        print(f"{addr[0]}:{addr[1]} -> {username} connected")
         logging.info("CONNECT user=%s ip=%s port=%s", username, addr[0], addr[1])
         broadcast(join_msg, exclude_sock=client_sock)
 
@@ -429,11 +429,11 @@ def handle_client(client_sock, addr):
 
             if is_command_packet:
                 if text.lower() == "/quit":
-                    send_packet(client_sock, {"type": "system", "text": "Baglanti kapatiliyor..."})
+                    send_packet(client_sock, {"type": "system", "text": "Connection is closing..."})
                     break
 
                 if text.lower() == "/list":
-                    send_packet(client_sock, {"type": "system", "text": f"Cevrimici: {online_users_text()}"})
+                    send_packet(client_sock, {"type": "system", "text": f"Online: {online_users_text()}"})
                     continue
 
                 if text.lower() == "/stats":
@@ -456,7 +456,7 @@ def handle_client(client_sock, addr):
                 if text.lower().startswith("/nick"):
                     parts = text.split(maxsplit=1)
                     if len(parts) < 2 or not parts[1].strip():
-                        send_packet(client_sock, {"type": "system", "text": "Kullanim: /nick <yeniad>"})
+                        send_packet(client_sock, {"type": "system", "text": "Usage: /nick <new_name>"})
                         continue
 
                     new_name = unique_name(parts[1])
@@ -466,13 +466,13 @@ def handle_client(client_sock, addr):
                     username = new_name
                     client_info["name"] = new_name
 
-                    broadcast({"type": "system", "text": f"{old_name} artik {new_name} olarak biliniyor."})
+                    broadcast({"type": "system", "text": f"{old_name} is now known as {new_name}."})
                     logging.info("NICK old=%s new=%s", old_name, new_name)
                     continue
 
             if now_ts < client_info["blocked_until"]:
                 remain = int(client_info["blocked_until"] - now_ts)
-                send_packet(client_sock, {"type": "system", "text": f"Gecici engellendiniz. Kalan sure: {remain}s"})
+                send_packet(client_sock, {"type": "system", "text": f"You are temporarily blocked. Remaining time: {remain}s"})
                 continue
 
             # Check if user is blocked by security system
@@ -481,7 +481,7 @@ def handle_client(client_sock, addr):
                 remain = int(remaining)
                 alert_msg = {
                     "type": "alert",
-                    "text": f"[SPAM/FLOOD] Engellendiz. Kalan sure: {remain}s",
+                    "text": f"[SPAM/FLOOD] You are blocked. Remaining time: {remain}s",
                     "target_uid": uid,
                     "target_username": username,
                     "block_reason": "blocked",
@@ -514,7 +514,7 @@ def handle_client(client_sock, addr):
                 
                 alert_msg = {
                     "type": "alert",
-                    "text": f"[SPAM] {username} çok hızlı tekrar mesaj gönderiyor. {int(block_duration)}s engellendi.",
+                    "text": f"[SPAM] {username} is sending repeated messages too quickly. Blocked for {int(block_duration)}s.",
                     "target_uid": uid,
                     "target_username": username,
                     "block_reason": "spam",
@@ -537,7 +537,7 @@ def handle_client(client_sock, addr):
                 alert_text = {
                     "type": "alert",
                     "text": (
-                        f"Supheli aktivite: user={client_info['name']} "
+                        f"Suspicious activity: user={client_info['name']} "
                         f"reason={reason} block={BLOCK_SECONDS}s"
                     ),
                     "target_uid": uid,
@@ -586,7 +586,7 @@ def handle_client(client_sock, addr):
             logging.info("MSG user=%s text=%s", client_info["name"], text)
 
     except Exception as exc:
-        print(f"Hata ({addr[0]}:{addr[1]}): {exc}")
+        print(f"Error ({addr[0]}:{addr[1]}): {exc}")
         logging.exception("CLIENT_ERROR ip=%s port=%s err=%s", addr[0], addr[1], exc)
     finally:
         remove_client(client_sock)
@@ -706,13 +706,13 @@ def maybe_start_ngrok(local_port):
     
     use_ngrok = os.getenv("USE_PYNGROK", "1").strip() != "0"
     if not use_ngrok:
-        print("[NGROK] Pyngrok otomatik acilis kapali (USE_PYNGROK=0 yaparsan kapatilir).")
+        print("[NGROK] Automatic pyngrok startup is disabled (set USE_PYNGROK=0).")
         return None
 
     try:
         from pyngrok import ngrok
     except ImportError:
-        print("[NGROK] pyngrok kurulu degil. Kurulum: pip install pyngrok")
+        print("[NGROK] pyngrok is not installed. Install with: pip install pyngrok")
         return None
 
     token = os.getenv("NGROK_AUTHTOKEN", "").strip()
@@ -728,7 +728,7 @@ def maybe_start_ngrok(local_port):
         host, port_text = endpoint.rsplit(":", 1)
         return host.strip(), int(port_text.strip())
     except Exception as exc:
-        print(f"[NGROK] Tunnel acilamadi: {exc}")
+        print(f"[NGROK] Failed to open tunnel: {exc}")
         return None
 
 
@@ -758,9 +758,9 @@ def main():
 
     print("=" * 45)
     print("  PYTHON CHAT SERVER")
-    print(f"  Dinleniyor: {HOST}:{PORT}")
+    print(f"  Listening on: {HOST}:{PORT}")
     print(f"  Admin Dashboard: {HOST}:{ADMIN_PORT}")
-    print("  Komutlar client tarafindan gonderilir: /quit /list /nick")
+    print("  Client commands: /quit /list /nick")
     print("=" * 45)
 
     ngrok_endpoint = maybe_start_ngrok(PORT)
@@ -794,7 +794,7 @@ def main():
             t = threading.Thread(target=handle_client, args=(client_sock, addr), daemon=True)
             t.start()
     except KeyboardInterrupt:
-        print("\n[SERVER] Kapatiliyor...")
+        print("\n[SERVER] Shutting down...")
     finally:
         running = False
         with clients_lock:
