@@ -3,6 +3,7 @@
 import sys
 import os
 import json
+import csv
 import base64
 import socket
 import queue
@@ -121,7 +122,7 @@ class SocketChatClient:
         except Exception as exc:
             self.event_queue.put({"type": "connection", "connected": False, "error": str(exc)})
 
-    def send_message(self, sender_uid: str, sender_name: str, receiver_uid: str, text: str, fingerprint: str = None) -> None:
+    def send_message(self, sender_uid: str, sender_name: str, receiver_uid: str, text: str, fingerprint: str = None, client_message_id: str = "") -> None:
         payload = {
             "type": "message",
             "sender_uid": sender_uid,
@@ -132,6 +133,8 @@ class SocketChatClient:
         }
         if fingerprint:
             payload["fingerprint"] = fingerprint
+        if client_message_id:
+            payload["client_message_id"] = client_message_id
         self._send_packet(payload)
 
     def _receive_loop(self) -> None:
@@ -431,6 +434,11 @@ class ChatWindow(QWidget):
         self._refresh_thread = None
         self._load_chat_thread = None
         self._socket_connect_thread = None
+        self._pending_rtt_samples = []
+        self._pending_raw_rtt_samples = []
+        self._pending_outgoing_message_ids = {}
+        self._rtt_csv_path = os.path.join(os.path.dirname(__file__), "tools", "data", "rtt_samples.csv")
+        self._rtt_csv_lock = threading.Lock()
         self.init_ui()
 
     def init_ui(self):
@@ -641,6 +649,10 @@ class ChatWindow(QWidget):
         self.update_timer.timeout.connect(self.refresh_contacts)
         self.update_timer.start(3000)
 
+        self.chat_refresh_timer = QTimer()
+        self.chat_refresh_timer.timeout.connect(self.refresh_open_chat)
+        self.chat_refresh_timer.start(2500)
+
         self.socket_timer = QTimer()
         self.socket_timer.timeout.connect(self.process_socket_events)
         self.socket_timer.start(300)
@@ -649,6 +661,192 @@ class ChatWindow(QWidget):
         self.chat_block_reason = ""
         self._local_spam_last_fingerprint = ""
         self._local_spam_repeat_count = 0
+
+    def _ensure_rtt_csv(self):
+        try:
+            os.makedirs(os.path.dirname(self._rtt_csv_path), exist_ok=True)
+            if not os.path.exists(self._rtt_csv_path) or os.path.getsize(self._rtt_csv_path) == 0:
+                with open(self._rtt_csv_path, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=[
+                            "timestamp",
+                            "source",
+                            "username",
+                            "receiver_uid",
+                            "chat_uid",
+                            "message_hash",
+                            "rtt_ms",
+                        ],
+                    )
+                    writer.writeheader()
+        except Exception:
+            pass
+
+    def _append_rtt_sample(self, rtt_ms: float, receiver_uid: str, message_text: str, source: str = "live"):
+        try:
+            self._ensure_rtt_csv()
+            row = {
+                "timestamp": datetime.now().isoformat(),
+                "source": source,
+                "username": self.current_user_name or self.current_user_tag or self.current_user_uid or "",
+                "receiver_uid": receiver_uid or "",
+                "chat_uid": self.current_chat_uid or "",
+                "message_hash": hashlib.sha256((message_text or "").encode("utf-8")).hexdigest(),
+                "rtt_ms": f"{float(rtt_ms):.2f}",
+            }
+            with self._rtt_csv_lock:
+                with open(self._rtt_csv_path, "a", encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=[
+                            "timestamp",
+                            "source",
+                            "username",
+                            "receiver_uid",
+                            "chat_uid",
+                            "message_hash",
+                            "rtt_ms",
+                        ],
+                    )
+                    writer.writerow(row)
+        except Exception:
+            pass
+
+    def _register_pending_rtt_sample(self, receiver_uid: str, message_text: str):
+        receiver_uid = str(receiver_uid or "").strip()
+        message_text = str(message_text or "")
+        if not receiver_uid or not message_text:
+            return
+
+        self._pending_rtt_samples.append({
+            "receiver_uid": receiver_uid,
+            "message_hash": hashlib.sha256(message_text.encode("utf-8")).hexdigest(),
+            "send_ts": time.perf_counter(),
+        })
+
+    def _register_pending_raw_rtt_sample(self, receiver_uid: str, fingerprint: str):
+        receiver_uid = str(receiver_uid or "").strip()
+        fingerprint = str(fingerprint or "").strip()
+        if not receiver_uid or not fingerprint:
+            return
+
+        self._pending_raw_rtt_samples.append({
+            "receiver_uid": receiver_uid,
+            "fingerprint": fingerprint,
+            "send_ts": time.perf_counter(),
+        })
+
+    def _append_live_message_bubble(self, message_text: str, receiver_uid: str):
+        try:
+            safe_text = html.escape(str(message_text or "")).replace("\n", "<br>")
+            time_str = datetime.now().strftime("%H:%M")
+            bubble_html = (
+                f"<span style='background:#dcf8c6; color:#111; border-radius:18px 18px 6px 18px; padding:8px 10px; display:inline-block; max-width:72%;'>"
+                f"<span style='white-space:pre-wrap; line-height:1.35; font-size:14px;'>{safe_text}</span><br>"
+                f"<span style='font-size:8px; opacity:0.7;'>{time_str}&nbsp;✓</span>"
+                f"</span>"
+            )
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            block_format = QTextBlockFormat()
+            block_format.setAlignment(Qt.AlignRight)
+            block_format.setTopMargin(3)
+            block_format.setBottomMargin(3)
+            cursor.insertBlock(block_format)
+            cursor.insertHtml(bubble_html)
+            self.chat_display.setTextCursor(cursor)
+            self.chat_display.moveCursor(QTextCursor.End)
+            return datetime.now().isoformat()
+        except Exception:
+            return datetime.now().isoformat()
+
+    def _append_received_message_bubble(self, message_text: str, message_timestamp: str):
+        """Append received message bubble to chat display (left-aligned, blue). Marked as read immediately."""
+        try:
+            safe_text = html.escape(str(message_text or "")).replace("\n", "<br>")
+            # Parse timestamp if provided
+            try:
+                ts_obj = datetime.fromisoformat(str(message_timestamp))
+                time_str = ts_obj.strftime("%H:%M")
+            except Exception:
+                time_str = datetime.now().strftime("%H:%M")
+            
+            # Received messages show no checkmark (already read by current user)
+            bubble_html = (
+                f"<span style='background:#e7f3ff; color:#111; border-radius:18px 18px 18px 6px; padding:8px 10px; display:inline-block; max-width:72%;'>"
+                f"<span style='white-space:pre-wrap; line-height:1.35; font-size:14px;'>{safe_text}</span><br>"
+                f"<span style='font-size:8px; opacity:0.7;'>{time_str}</span>"
+                f"</span>"
+            )
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            block_format = QTextBlockFormat()
+            block_format.setAlignment(Qt.AlignLeft)
+            block_format.setTopMargin(3)
+            block_format.setBottomMargin(3)
+            cursor.insertBlock(block_format)
+            cursor.insertHtml(bubble_html)
+            self.chat_display.setTextCursor(cursor)
+            self.chat_display.moveCursor(QTextCursor.End)
+            return datetime.now().isoformat()
+        except Exception as e:
+            print(f"[RECEIVED_BUBBLE] Error: {e}")
+            return datetime.now().isoformat()
+
+    def _consume_pending_raw_rtt_sample(self, receiver_uid: str, fingerprint: str):
+        receiver_uid = str(receiver_uid or "").strip()
+        fingerprint = str(fingerprint or "").strip()
+        if not receiver_uid or not fingerprint:
+            return False
+
+        for idx, sample in enumerate(list(self._pending_raw_rtt_samples)):
+            if sample.get("receiver_uid") != receiver_uid:
+                continue
+            if sample.get("fingerprint") != fingerprint:
+                continue
+
+            rtt_ms = (time.perf_counter() - float(sample.get("send_ts", time.perf_counter()))) * 1000.0
+            # Write raw RTT in background to avoid UI blocking
+            def _write_raw():
+                self._append_rtt_sample(rtt_ms, receiver_uid, f"raw:{fingerprint}", source="raw")
+            threading.Thread(target=_write_raw, daemon=True).start()
+            try:
+                self._pending_raw_rtt_samples.pop(idx)
+            except Exception:
+                pass
+            return True
+
+        return False
+
+    def _consume_pending_rtt_sample(self, receiver_uid: str, message_text: str, message_timestamp: str):
+        receiver_uid = str(receiver_uid or "").strip()
+        if not receiver_uid:
+            return False
+
+        message_hash = hashlib.sha256(str(message_text or "").encode("utf-8")).hexdigest()
+        try:
+            message_time = datetime.fromisoformat(str(message_timestamp)).timestamp()
+        except Exception:
+            message_time = time.time()
+
+        for idx, sample in enumerate(list(self._pending_rtt_samples)):
+            if sample.get("receiver_uid") != receiver_uid:
+                continue
+            if sample.get("message_hash") != message_hash:
+                continue
+            if message_time + 1.0 < float(sample.get("send_ts", 0.0)):
+                continue
+
+            rtt_ms = (time.time() - float(sample.get("send_ts", time.time()))) * 1000.0
+            self._append_rtt_sample(rtt_ms, receiver_uid, message_text)
+            try:
+                self._pending_rtt_samples.pop(idx)
+            except Exception:
+                pass
+            return True
+
+        return False
 
     def _set_message_controls_enabled(self, enabled: bool):
         self.message_input.setEnabled(enabled)
@@ -661,6 +859,8 @@ class ChatWindow(QWidget):
             self._set_message_controls_enabled(False)
             if self.chat_block_reason == "spam":
                 self.message_input.setPlaceholderText(f"Blocked due to spam ({remain}s)")
+            elif self.chat_block_reason == "repetition":
+                self.message_input.setPlaceholderText(f"Blocked due to repetition ({remain}s)")
             else:
                 self.message_input.setPlaceholderText(f"Message sending blocked ({remain}s)")
         else:
@@ -691,8 +891,8 @@ class ChatWindow(QWidget):
 
         if self._local_spam_repeat_count >= LOCAL_SPAM_THRESHOLD:
             self.chat_blocked_until = time.time() + 30
-            self.chat_block_reason = "spam"
-            self.show_alert("[SPAM] You are sending messages too quickly. Blocked for 30s.", duration_ms=5000)
+            self.chat_block_reason = "repetition"
+            self.show_alert("[REPETITION] You are sending the same message repeatedly. Blocked for 30s.", duration_ms=5000)
             self._sync_message_block_state()
             return True
 
@@ -918,15 +1118,49 @@ class ChatWindow(QWidget):
 
             sender_uid = str(packet.get("sender_uid", "")).strip()
             receiver_uid = str(packet.get("receiver_uid", "")).strip()
+            fingerprint = str(packet.get("fingerprint", "")).strip()
 
             if sender_uid == self.current_user_uid:
+                self._consume_pending_raw_rtt_sample(receiver_uid, fingerprint)
+                client_message_id = str(packet.get("client_message_id", "")).strip()
+                if client_message_id:
+                    self._pending_outgoing_message_ids.pop(client_message_id, None)
+                if self.current_chat_uid == receiver_uid:
+                    # the local optimistic append already showed the message; no full reload needed here
+                    pass
                 continue
 
             if not self.current_chat_uid:
                 continue
 
             if sender_uid == self.current_chat_uid and receiver_uid == self.current_user_uid:
-                self.load_chat_messages()
+                # Append incoming message directly to UI (no slow Firebase reload)
+                encrypted_text = str(packet.get("text", "")).strip()
+                message_ts = packet.get("timestamp", datetime.now().isoformat())
+                if encrypted_text:
+                    # Decrypt E2E encrypted message
+                    try:
+                        message_text = self._decrypt_message_e2e(encrypted_text)
+                    except Exception as e:
+                        print(f"[DECRYPT] Error: {e}")
+                        message_text = "[Failed to decrypt]"
+                    
+                    # Render on main thread (fast, ~1-2ms, no blocking)
+                    try:
+                        self._append_received_message_bubble(message_text, message_ts)
+                    except Exception as e:
+                        print(f"[RECV_BUBBLE] Error: {e}")
+                    
+                    # Mark messages as read in Firebase background thread
+                    def _mark_read():
+                        try:
+                            firebase.mark_messages_as_read(self.current_chat_uid, self.current_user_uid)
+                            # Immediately refresh contacts to update unread count
+                            self.refresh_contacts()
+                        except Exception as e:
+                            print(f"[MARK_READ] Error: {e}")
+                    
+                    threading.Thread(target=_mark_read, daemon=True).start()
 
         self._sync_message_block_state()
 
@@ -953,6 +1187,29 @@ class ChatWindow(QWidget):
 
         self._refresh_thread = threading.Thread(target=_fetch, daemon=True)
         self._refresh_thread.start()
+
+    def refresh_open_chat(self):
+        """Refresh the currently open chat so read receipts update while the conversation stays open."""
+        if not self.current_user_uid or not self.current_chat_uid:
+            return
+
+        now_ts = time.time()
+        for message_id, sent_ts in list(self._pending_outgoing_message_ids.items()):
+            if now_ts - sent_ts > 5.0:
+                self._pending_outgoing_message_ids.pop(message_id, None)
+
+        if self._pending_outgoing_message_ids:
+            return
+
+        # Keep the current chat visible; only sync read state and contacts.
+        def _sync_read_state():
+            try:
+                firebase.mark_messages_as_read(self.current_chat_uid, self.current_user_uid)
+                self.refresh_contacts()
+            except Exception as e:
+                print(f"[SYNC_OPEN_CHAT] Error: {e}")
+
+        threading.Thread(target=_sync_read_state, daemon=True).start()
 
     def _apply_contacts(self, data: dict):
         try:
@@ -1188,6 +1445,8 @@ class ChatWindow(QWidget):
                 other_user = firebase.get_user_profile(self.current_chat_uid)
                 other_username = other_user.get("username", "Unknown")
                 self.signals.chat_loaded.emit({"messages": messages, "other_username": other_username})
+                # Refresh contact list to update unread count
+                self.refresh_contacts()
             except Exception as e:
                 print(f"Message load error: {e}")
 
@@ -1231,6 +1490,7 @@ class ChatWindow(QWidget):
                 is_own_message = sender_uid == current_uid
 
                 if is_own_message:
+                    # Sent messages show double tick if recipient read, single tick otherwise
                     read_mark = "✓✓" if msg.get("read") else "✓"
                     bubble_html = (
                         f"<span style='background:#dcf8c6; color:#111; border-radius:18px 18px 6px 18px; padding:8px 10px; display:inline-block; max-width:72%;'>"
@@ -1257,12 +1517,17 @@ class ChatWindow(QWidget):
                 cursor.insertHtml(bubble_html)
                 self.chat_display.setTextCursor(cursor)
 
+                if is_own_message:
+                    self._consume_pending_rtt_sample(receiver_uid, display_text, timestamp)
+
             self.chat_display.moveCursor(QTextCursor.End)
         except Exception as e:
             print(f"Message UI update error: {e}")
 
     def send_message(self):
         """Send message"""
+        send_started = time.perf_counter()  # Start timing at very beginning with high resolution
+        
         if not self.current_chat_uid:
             QMessageBox.warning(self, "Error", "Please select a contact!")
             return
@@ -1284,31 +1549,63 @@ class ChatWindow(QWidget):
         try:
             # compute fingerprint from plaintext so server can detect repeats
             fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()
-            # Use E2E encryption (message send is blocked if keys are not ready)
-            to_send = self._encrypt_message_e2e(message, self.current_chat_uid)
+            client_message_id = f"{time.time_ns()}-{fingerprint[:12]}"
 
-            # Store fully encrypted payload in Firebase (sender+receiver specific ciphers)
-            encrypted_storage_text = self._build_encrypted_storage_text(message, self.current_chat_uid)
-            if not encrypted_storage_text:
-                QMessageBox.warning(self, "Error", "Encryption keys are not ready yet. Please retry.")
-                return
+            # Clear input immediately (before any rendering)
+            self.message_input.clear()
+            
+            # Render bubble on main thread (GUI operations must run on main thread)
+            try:
+                self._append_live_message_bubble(message, self.current_chat_uid)
+            except Exception as e:
+                print(f"[BUBBLE] Render error: {e}")
 
-            success = firebase.send_message(self.current_user_uid, self.current_chat_uid, encrypted_storage_text)
+            self._pending_outgoing_message_ids[client_message_id] = time.time()
+            
+            self._register_pending_raw_rtt_sample(self.current_chat_uid, fingerprint)
+            self._register_local_spam_signal(fingerprint)
 
-            if success:
-                # include fingerprint in real-time socket packet for spam detection
-                self.socket_client.send_message(
-                    self.current_user_uid,
-                    self.current_user_name or self.current_user_tag or self.current_user_uid,
-                    self.current_chat_uid,
-                    to_send,  # Send encrypted version via socket
-                    fingerprint=fingerprint,
-                )
-                self._register_local_spam_signal(fingerprint)
-                self.message_input.clear()
-                self.load_chat_messages()
-            else:
-                QMessageBox.warning(self, "Error", "Message could not be sent!")
+            def _send_firebase_payload():
+                try:
+                    # Measure RTT from send_message start to Firebase+Socket completion
+                    # Use E2E encryption (done in background)
+                    to_send = self._encrypt_message_e2e(message, self.current_chat_uid)
+                    encrypted_storage_text = self._build_encrypted_storage_text(message, self.current_chat_uid)
+                    if not encrypted_storage_text:
+                        print("[SEND] Encryption keys not ready")
+                        return
+                    success = firebase.send_message(self.current_user_uid, self.current_chat_uid, encrypted_storage_text)
+                    if not success:
+                        print("[SEND] Firebase message could not be stored")
+                        return
+                    
+                    # Do NOT reload chat messages here - socket will deliver the message and trigger refresh
+                    # Reloading here causes UI flicker (clear -> empty -> reload from Firebase)
+                    
+                    # Send via socket after Firebase (ensures ordering)
+                    try:
+                        self.socket_client.send_message(
+                            self.current_user_uid,
+                            self.current_user_name or self.current_user_tag or self.current_user_uid,
+                            self.current_chat_uid,
+                            to_send,
+                            fingerprint=fingerprint,
+                            client_message_id=client_message_id,
+                        )
+                    except Exception as sock_exc:
+                        print(f"[SEND] Socket send error: {sock_exc}")
+                    
+                    # Measure end-to-end RTT (from initial send_message to Firebase+Socket completion)
+                    live_rtt_ms = (time.perf_counter() - send_started) * 1000.0
+                    # Write as "live" RTT (user-perceived latency)
+                    def _write_live_rtt():
+                        self._append_rtt_sample(live_rtt_ms, self.current_chat_uid, message, source="live")
+                    threading.Thread(target=_write_live_rtt, daemon=True).start()
+                    
+                except Exception as send_exc:
+                    print(f"[SEND] Firebase send error: {send_exc}")
+
+            threading.Thread(target=_send_firebase_payload, daemon=True).start()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Send error: {str(e)}")
 

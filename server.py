@@ -6,6 +6,7 @@ import logging
 import json
 from datetime import datetime
 from collections import deque
+import csv
 
 HOST = "0.0.0.0"
 PORT = 5555
@@ -14,7 +15,7 @@ BUFFER_SIZE = 2048
 
 RATE_LIMIT_MESSAGES = 10
 RATE_LIMIT_WINDOW_SEC = 5
-REPEAT_THRESHOLD = 10
+REPEAT_THRESHOLD = 5
 EMPTY_THRESHOLD = 8
 BLOCK_SECONDS = 30
 MONITOR_INTERVAL_SEC = 10
@@ -45,10 +46,11 @@ admin_clients_lock = threading.Lock()
 rtt_measurements = []  # List of RTT values for averaging
 rtt_lock = threading.Lock()
 METRICS_FILE = "rtt_metrics.csv"
+DETECTION_CSV = "detection_events.csv"
 
 FAILED_LOGIN_THRESHOLD = 3
 FAILED_LOGIN_BLOCK_SECONDS = 60
-REPEAT_MESSAGE_THRESHOLD = 5  # Changed from 10 to 5 for faster spam detection
+REPEAT_MESSAGE_THRESHOLD = 5
 INITIAL_BLOCK_SECONDS = 30
 BLOCK_RESET_HOURS = 24
 
@@ -71,6 +73,29 @@ def write_metrics(rtt_ms: float):
             total_msgs = server_stats["total_messages"]
         with open(METRICS_FILE, "a", encoding="utf-8") as f:
             f.write(f"{datetime.utcnow().isoformat()},{rtt_ms:.2f},{client_count},{total_msgs}\n")
+    except Exception:
+        pass
+
+
+def append_detection_csv(row: dict):
+    """Append a detection/event row to DETECTION_CSV. Creates header if missing."""
+    fieldnames = [
+        "timestamp",
+        "username",
+        "event",
+        "detail",
+        "repeat_count",
+        "failed_count",
+        "blocked_until",
+        "response_ms",
+    ]
+    try:
+        file_exists = os.path.exists(DETECTION_CSV)
+        with open(DETECTION_CSV, "a", encoding="utf-8", newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
     except Exception:
         pass
 
@@ -205,14 +230,28 @@ def check_brute_force_login(username):
                         df.write(f"{datetime.utcnow().isoformat()} - BRUTE_FORCE detected - user={username} failed={failed_logins[username]}\n")
                 except Exception:
                     pass
+                # Append structured CSV entry
+                try:
+                    append_detection_csv({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "username": username,
+                        "event": "brute_force",
+                        "detail": "failed_login_threshold_reached",
+                        "repeat_count": "",
+                        "failed_count": failed_logins[username],
+                        "blocked_until": block_list.get(username, {}).get("blocked_until", ""),
+                        "response_ms": "",
+                    })
+                except Exception:
+                    pass
                 return True
     return False
 
 
 def check_repeated_message(username, current_msg):
-    """Check for repeated message spam. Return True if spam detected. Thread-safe."""
+    """Check for repeated message repetition. Return a reason string if detected. Thread-safe."""
     if not current_msg or not current_msg.strip():
-        return False
+        return None
     
     with repeat_count_lock:
         prev = last_message.get(username)
@@ -234,14 +273,14 @@ def check_repeated_message(username, current_msg):
         add_to_block_list(username, block_level=current_block_level)
         with repeat_count_lock:
             repeat_count[username] = 0  # Reset after block
-        # Log spam detection
+        # Log repetition detection
         try:
             with open("detection.log", "a", encoding="utf-8") as df:
-                df.write(f"{datetime.utcnow().isoformat()} - SPAM detected - user={username} repeat_count={current_repeat} key={str(current_msg)[:64]}\n")
+                df.write(f"{datetime.utcnow().isoformat()} - REPETITION detected - user={username} repeat_count={current_repeat} key={str(current_msg)[:64]}\n")
         except Exception:
             pass
-        return True
-    return False
+        return f"Repetition detected: same message sent {current_repeat} times in a row"
+    return None
 
 
 def remove_client(sock):
@@ -321,27 +360,30 @@ def user_stats_text(client_info):
     )
 
 
+def print_monitor_status():
+    """Print current monitor status."""
+    with clients_lock:
+        connected = len(clients)
+        total_msgs = server_stats["total_messages"]
+        total_alerts = server_stats["total_alerts"]
+        top_user = None
+        top_count = -1
+        for info in clients.values():
+            if info["total_messages"] > top_count:
+                top_count = info["total_messages"]
+                top_user = info["name"]
+    summary = (
+        f"MONITOR connected={connected} total_messages={total_msgs} "
+        f"total_alerts={total_alerts} top_user={top_user or '-'}"
+    )
+    print(f"[MONITOR] {summary}")
+    logging.info(summary)
+
+
 def monitor_loop():
     while running:
         time.sleep(MONITOR_INTERVAL_SEC)
-        with clients_lock:
-            connected = len(clients)
-            total_msgs = server_stats["total_messages"]
-            total_alerts = server_stats["total_alerts"]
-
-            top_user = None
-            top_count = -1
-            for info in clients.values():
-                if info["total_messages"] > top_count:
-                    top_count = info["total_messages"]
-                    top_user = info["name"]
-
-        summary = (
-            f"MONITOR connected={connected} total_messages={total_msgs} "
-            f"total_alerts={total_alerts} top_user={top_user or '-'}"
-        )
-        print(f"[MONITOR] {summary}")
-        logging.info(summary)
+        print_monitor_status()
 
 
 def handle_client(client_sock, addr):
@@ -389,6 +431,7 @@ def handle_client(client_sock, addr):
         join_msg = {"type": "system", "text": f"{username} joined the chat.", "uid": uid, "name": username}
         print(f"{addr[0]}:{addr[1]} -> {username} connected")
         logging.info("CONNECT user=%s ip=%s port=%s", username, addr[0], addr[1])
+        print_monitor_status()
         broadcast(join_msg, exclude_sock=client_sock)
 
         while True:
@@ -498,11 +541,16 @@ def handle_client(client_sock, addr):
             fingerprint = packet.get("fingerprint") if isinstance(packet, dict) else None
             check_val = fingerprint or text
             print(f"[SPAM_CHECK] user={username} key='{(check_val[:30] if isinstance(check_val, str) else str(check_val))}'")
-            if check_repeated_message(username, check_val):
+            # measure detection -> alert send timing
+            detect_call_ts = time.time()
+            repetition_reason = check_repeated_message(username, check_val)
+            if repetition_reason:
+                alert_sent_ts = time.time()
+                response_ms = (alert_sent_ts - detect_call_ts) * 1000.0
                 client_info["alerts"] += 1
                 with clients_lock:
                     server_stats["total_alerts"] += 1
-                
+
                 # Also update client_info blocked_until for consistency
                 current_block_level = 1
                 with block_list_lock:
@@ -511,55 +559,109 @@ def handle_client(client_sock, addr):
                 block_duration = INITIAL_BLOCK_SECONDS * (2 ** (current_block_level - 1))
                 now_ts = time.time()
                 client_info["blocked_until"] = now_ts + block_duration
-                
+
                 alert_msg = {
                     "type": "alert",
-                    "text": f"[SPAM] {username} is sending repeated messages too quickly. Blocked for {int(block_duration)}s.",
+                    "text": f"[REPETITION] {username} is sending the same message repeatedly. Blocked for {int(block_duration)}s.",
                     "target_uid": uid,
                     "target_username": username,
-                    "block_reason": "spam",
+                    "block_reason": "repetition",
                     "blocked_until": client_info["blocked_until"],
                     "block_seconds": int(block_duration),
                 }
+                # append structured CSV entry for this repetition detection including server-side response_ms
+                try:
+                    append_detection_csv({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "username": username,
+                        "event": "repetition",
+                        "detail": str(check_val)[:128],
+                        "repeat_count": repeat_count.get(username, ""),
+                        "failed_count": "",
+                        "blocked_until": client_info["blocked_until"],
+                        "response_ms": f"{response_ms:.2f}",
+                    })
+                except Exception:
+                    pass
+
                 send_packet(client_sock, alert_msg)
-                logging.warning("SPAM_DETECTED user=%s ip=%s port=%s duration=%ds", username, addr[0], addr[1], int(block_duration))
-                print(f"[SPAM_DETECTED] {username}: blocked for {int(block_duration)}s")
+                logging.warning("REPETITION_DETECTED user=%s ip=%s port=%s duration=%ds", username, addr[0], addr[1], int(block_duration))
+                print(f"[REPETITION_DETECTED] {username}: blocked for {int(block_duration)}s")
                 continue
 
             reason = detect_intrusion(client_info, text, now_ts)
             if reason:
+                # record detection timestamp and measure server-side response time
+                detect_ts = time.time()
                 client_info["alerts"] += 1
                 client_info["blocked_count"] += 1
                 client_info["blocked_until"] = now_ts + BLOCK_SECONDS
                 with clients_lock:
                     server_stats["total_alerts"] += 1
 
-                alert_text = {
-                    "type": "alert",
-                    "text": (
+                is_rate_limit_spam = reason.startswith("Spam/Flood")
+                alert_reason = "spam" if is_rate_limit_spam else "suspicious"
+                alert_text_value = (
+                    f"[SPAM] {client_info['name']} is sending messages too quickly. Blocked for {BLOCK_SECONDS}s."
+                    if is_rate_limit_spam
+                    else (
                         f"Suspicious activity: user={client_info['name']} "
                         f"reason={reason} block={BLOCK_SECONDS}s"
-                    ),
+                    )
+                )
+
+                alert_text = {
+                    "type": "alert",
+                    "text": alert_text_value,
                     "target_uid": uid,
                     "target_username": username,
-                    "block_reason": "suspicious",
+                    "block_reason": alert_reason,
                     "blocked_until": client_info["blocked_until"],
                     "block_seconds": BLOCK_SECONDS,
                 }
-                # Log suspicious activity to detection.log
+                # Log suspicious activity to detection.log and CSV
                 try:
                     with open("detection.log", "a", encoding="utf-8") as df:
-                        df.write(f"{datetime.utcnow().isoformat()} - SUSPICIOUS activity - user={username} reason={reason}\n")
+                        df.write(
+                            f"{datetime.utcnow().isoformat()} - {alert_reason.upper()} activity - user={username} reason={reason}\n"
+                        )
                 except Exception:
                     pass
+
+                # append CSV entry (response_ms measured as approx time until sending alert)
+                try:
+                    alert_send_ts = time.time()
+                    response_ms = (alert_send_ts - detect_ts) * 1000.0
+                    append_detection_csv({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "username": username,
+                        "event": alert_reason,
+                        "detail": reason,
+                        "repeat_count": client_info.get("repeat_count", ""),
+                        "failed_count": "",
+                        "blocked_until": client_info["blocked_until"],
+                        "response_ms": f"{response_ms:.2f}",
+                    })
+                except Exception:
+                    pass
+
                 send_packet(client_sock, alert_text)
-                logging.warning(
-                    "ALERT user=%s ip=%s port=%s reason=%s",
-                    client_info["name"],
-                    addr[0],
-                    addr[1],
-                    reason,
-                )
+                if is_rate_limit_spam:
+                    logging.warning(
+                        "SPAM user=%s ip=%s port=%s reason=%s",
+                        client_info["name"],
+                        addr[0],
+                        addr[1],
+                        reason,
+                    )
+                else:
+                    logging.warning(
+                        "ALERT user=%s ip=%s port=%s reason=%s",
+                        client_info["name"],
+                        addr[0],
+                        addr[1],
+                        reason,
+                    )
                 continue
 
             client_info["total_messages"] += 1
@@ -581,6 +683,8 @@ def handle_client(client_sock, addr):
                     "receiver_uid": str(packet.get("receiver_uid", "")).strip(),
                     "text": text,
                     "timestamp": packet.get("timestamp") or datetime.now().isoformat(),
+                    "fingerprint": packet.get("fingerprint", ""),
+                    "client_message_id": packet.get("client_message_id", ""),
                 }
             )
             logging.info("MSG user=%s text=%s", client_info["name"], text)
@@ -603,6 +707,7 @@ def handle_admin_client(admin_sock, addr):
     
     print(f"[ADMIN] Connection accepted from {addr[0]}:{addr[1]}")
     logging.info("ADMIN_CONNECT ip=%s port=%s", addr[0], addr[1])
+    print_monitor_status()
     
     try:
         admin_sock.settimeout(60)
